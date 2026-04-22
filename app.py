@@ -1595,3 +1595,834 @@ def gerar_resumo_sopradores(df):
     linhas.append("Sopradores Nitrificação:")
     linhas.append(" ".join(nitr_linha) if nitr_linha else "—")
     return "\n".join(linhas)
+    # ==============================================================================
+# MICROBIOLOGIA — Análise de imagens via Google Gemini + Regras CETESB L1.025
+# ==============================================================================
+# COMO USAR:
+#   Cole este bloco inteiro no FINAL do seu app.py,
+#   logo após a função gerar_resumo_sopradores().
+#   Depois adicione a chamada:
+#
+#       render_microbiologia()
+#
+#   no final do arquivo (após o bloco do resumo de sopradores).
+#
+# SECRETS necessários no Streamlit Cloud (.streamlit/secrets.toml):
+#   GOOGLE_API_KEY   = "sua-chave-1"
+#   GOOGLE_API_KEY_2 = "sua-chave-2"
+#   GOOGLE_API_KEY_3 = "sua-chave-3"
+# ==============================================================================
+
+import base64, tempfile, json, os, time as _time
+import subprocess
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TABELA 6 CETESB L1.025 — mapeamento organismo → diagnóstico
+# ──────────────────────────────────────────────────────────────────────────────
+_MICRO_TABELA6 = {
+    "flagelados": {
+        "semaforo": "vermelho",
+        "condicao": "Deficiência de aeração, má depuração e/ou sobrecarga orgânica",
+        "recomendacao": "Verificar OD no tanque de aeração. Reduzir carga orgânica ou aumentar aeração.",
+    },
+    "flagelados_rizopodes": {
+        "semaforo": "laranja",
+        "condicao": "Lodo jovem — início de operação ou θc baixa",
+        "recomendacao": "Verificar idade do lodo. Sistema em partida ou com sobrecarga hidráulica.",
+    },
+    "ciliados_pedunculados": {
+        "semaforo": "verde",
+        "condicao": "Boas condições de depuração (ciliados pedunculados)",
+        "recomendacao": "Sistema operando bem. Manter parâmetros atuais.",
+    },
+    "ciliados_livres": {
+        "semaforo": "verde",
+        "condicao": "Boas condições de depuração (ciliados livres)",
+        "recomendacao": "Sistema operando bem.",
+    },
+    "arcella": {
+        "semaforo": "verde",
+        "condicao": "Boa depuração — Arcella sp. presente",
+        "recomendacao": "Indicador positivo. Manter condições atuais.",
+    },
+    "aspidisca": {
+        "semaforo": "verde",
+        "condicao": "Nitrificação ocorrendo — Aspidisca costata",
+        "recomendacao": "Nitrificação ativa. Monitorar amônia e nitrito.",
+    },
+    "trachelophyllum": {
+        "semaforo": "laranja",
+        "condicao": "Idade do lodo (θc) elevada — Trachelophyllum",
+        "recomendacao": "Lodo velho. Avaliar descarte para rejuvenescer a biomassa.",
+    },
+    "vorticella_microstoma": {
+        "semaforo": "vermelho",
+        "condicao": "Efluente de má qualidade — Vorticella microstoma",
+        "recomendacao": "Investigar causa: sobrecarga, tóxicos ou aeração insuficiente.",
+    },
+    "aelosoma": {
+        "semaforo": "laranja",
+        "condicao": "Excesso de OD — Aelosoma (anelídeo)",
+        "recomendacao": "Reduzir aeração. OD possivelmente > 6 mg/L.",
+    },
+    "rotiferos": {
+        "semaforo": "verde",
+        "condicao": "Lodo maduro com boa sedimentação — Rotíferos presentes",
+        "recomendacao": "Indicador positivo de lodo aeróbio maduro.",
+    },
+    "filamentos": {
+        "semaforo": "vermelho",
+        "condicao": "Risco de intumescimento filamentoso (bulking)",
+        "recomendacao": "Verificar IVL. Causas: baixo OD, sobrecarga, pH baixo, falta de nutrientes.",
+    },
+    "nematoides": {
+        "semaforo": "laranja",
+        "condicao": "θc elevada — Nematóides presentes",
+        "recomendacao": "Monitorar descarte de lodo.",
+    },
+    "rizopodes_amebas": {
+        "semaforo": "laranja",
+        "condicao": "Lodo jovem ou em transição — Amebas/Rizópodes",
+        "recomendacao": "Verificar idade do lodo e condições operacionais.",
+    },
+    "flocos_bons": {
+        "semaforo": "verde",
+        "condicao": "Flocos bem formados — boa sedimentação",
+        "recomendacao": "Morfologia do lodo adequada. Manter operação.",
+    },
+    "flocos_dispersos": {
+        "semaforo": "vermelho",
+        "condicao": "Lodo disperso (pin-point) — má sedimentação",
+        "recomendacao": "Verificar θc, toxicidade e variações de carga.",
+    },
+    "cianobacterias": {
+        "semaforo": "vermelho",
+        "condicao": "Cianobactérias — risco de toxicidade",
+        "recomendacao": "ALERTA: possível toxicidade. Verificar origem do afluente.",
+    },
+    "protozoa_livre": {
+        "semaforo": "laranja",
+        "condicao": "Protozoários de vida livre — qualidade moderada",
+        "recomendacao": "Monitorar evolução. Pode indicar lodo jovem ou perturbação.",
+    },
+}
+
+_COR = {"verde": "#43A047", "laranja": "#FB8C00", "vermelho": "#E53935", "cinza": "#546E7A"}
+
+_PESO_CETESB = {
+    "ciliados_pedunculados": +3,
+    "ciliados_livres":       +2,
+    "rotiferos":             +3,
+    "arcella":               +2,
+    "aspidisca":             +2,
+    "flocos_bons":           +2,
+    "nematoides":            +1,
+    "trachelophyllum":        0,
+    "aelosoma":              -1,
+    "protozoa_livre":         0,
+    "rizopodes_amebas":      -1,
+    "flagelados_rizopodes":  -1,
+    "flocos_dispersos":      -2,
+    "flagelados":            -3,
+    "vorticella_microstoma": -3,
+    "filamentos":            -2,
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GERENCIAMENTO DE CHAVES API
+# ──────────────────────────────────────────────────────────────────────────────
+def _carregar_chaves_gemini() -> list:
+    if not hasattr(st, "secrets"):
+        return []
+    chaves = []
+    for nome in ["GOOGLE_API_KEY", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY_3", "GOOGLE_API_KEY_4"]:
+        v = st.secrets.get(nome, "")
+        if v:
+            chaves.append(v)
+    return chaves
+
+# ──────────────────────────────────────────────────────────────────────────────
+# COTA DIÁRIA / POR MINUTO
+# ──────────────────────────────────────────────────────────────────────────────
+_COTA_FILE = "/tmp/gemini_cota_micro.json"
+
+def _cota_carregar() -> dict:
+    from datetime import datetime, timezone, timedelta
+    BRT = timezone(timedelta(hours=-3))
+    agora = datetime.now(BRT)
+    reset_hoje = agora.replace(hour=4, minute=0, second=0, microsecond=0)
+    if agora < reset_hoje:
+        reset_hoje -= timedelta(days=1)
+    padrao = {"total_dia": 0, "ultimo_reset": reset_hoje.isoformat(), "historico_min": []}
+    if not os.path.exists(_COTA_FILE):
+        return padrao
+    try:
+        with open(_COTA_FILE) as f:
+            dados = json.load(f)
+        ultimo_reset = datetime.fromisoformat(dados["ultimo_reset"])
+        if ultimo_reset < reset_hoje:
+            dados["total_dia"] = 0
+            dados["ultimo_reset"] = reset_hoje.isoformat()
+            dados["historico_min"] = []
+        return dados
+    except Exception:
+        return padrao
+
+def _cota_salvar(dados: dict):
+    try:
+        with open(_COTA_FILE, "w") as f:
+            json.dump(dados, f)
+    except Exception:
+        pass
+
+def _cota_incrementar():
+    from datetime import datetime, timezone, timedelta
+    BRT = timezone(timedelta(hours=-3))
+    agora = datetime.now(BRT).timestamp()
+    dados = _cota_carregar()
+    dados["total_dia"] = dados.get("total_dia", 0) + 1
+    hist = [t for t in dados.get("historico_min", []) if agora - t < 60]
+    hist.append(agora)
+    dados["historico_min"] = hist
+    _cota_salvar(dados)
+    return dados["total_dia"], len(hist)
+
+def _cota_status() -> dict:
+    from datetime import datetime, timezone, timedelta
+    BRT = timezone(timedelta(hours=-3))
+    agora = datetime.now(BRT).timestamp()
+    dados = _cota_carregar()
+    hist = [t for t in dados.get("historico_min", []) if agora - t < 60]
+    n_chaves = len(_carregar_chaves_gemini())
+    lim = max(n_chaves, 1)
+    return {
+        "total_dia":  dados.get("total_dia", 0),
+        "limite_dia": 1500 * lim,
+        "req_min":    len(hist),
+        "limite_min": 15 * lim,
+        "n_chaves":   n_chaves,
+    }
+
+def _cota_widget():
+    from datetime import datetime, timezone, timedelta
+    BRT = timezone(timedelta(hours=-3))
+    agora = datetime.now(BRT)
+    reset = agora.replace(hour=4, minute=0, second=0, microsecond=0)
+    if agora >= reset:
+        reset += timedelta(days=1)
+    hh = int((reset - agora).total_seconds() // 3600)
+    mm = int(((reset - agora).total_seconds() % 3600) // 60)
+    s = _cota_status()
+    pct = s["total_dia"] / s["limite_dia"] if s["limite_dia"] else 0
+    cor = "🟢" if pct < 0.6 else ("🟡" if pct < 0.85 else "🔴")
+    with st.expander(f"{cor} Cota Gemini — {s['total_dia']}/{s['limite_dia']} req hoje", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Usadas hoje",   s["total_dia"],  delta=f"/{s['limite_dia']}")
+        c2.metric("Req/min agora", s["req_min"],    delta=f"/{s['limite_min']} limite")
+        c3.metric("Chaves ativas", s["n_chaves"])
+        st.progress(min(pct, 1.0))
+        st.caption(f"Reset em {hh}h {mm}min (04:00 BRT) · Dados aproximados por sessão")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EXTRAÇÃO DE FRAMES (vídeo via ffmpeg)
+# ──────────────────────────────────────────────────────────────────────────────
+def _extrair_frames_video(video_bytes: bytes) -> list:
+    frames_b64 = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vpath = os.path.join(tmpdir, "video.mp4")
+        with open(vpath, "wb") as f:
+            f.write(video_bytes)
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", vpath],
+            capture_output=True, text=True
+        )
+        try:
+            duration = float(result.stdout.strip())
+        except Exception:
+            duration = 10.0
+        for i, t in enumerate([duration * 0.33, duration * 0.66]):
+            fpath = os.path.join(tmpdir, f"frame_{i:02d}.jpg")
+            subprocess.run(
+                ["ffmpeg", "-ss", str(t), "-i", vpath,
+                 "-vframes", "1", "-vf", "scale=768:-1", "-q:v", "5",
+                 fpath, "-y"],
+                capture_output=True
+            )
+            if os.path.exists(fpath):
+                with open(fpath, "rb") as fimg:
+                    frames_b64.append(base64.b64encode(fimg.read()).decode())
+    return frames_b64
+
+# ──────────────────────────────────────────────────────────────────────────────
+# COMPRESSÃO DE IMAGEM (economiza tokens na API)
+# ──────────────────────────────────────────────────────────────────────────────
+def _comprimir_b64(b64: str, max_lado: int = 1024, qualidade: int = 82) -> str:
+    try:
+        from PIL import Image
+        import io as _io
+        data = base64.b64decode(b64)
+        img = Image.open(_io.BytesIO(data)).convert("RGB")
+        w, h = img.size
+        if max(w, h) > max_lado:
+            ratio = max_lado / max(w, h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=qualidade, optimize=True)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return b64
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PROMPT DO SISTEMA — especialista CETESB L1.025
+# ──────────────────────────────────────────────────────────────────────────────
+_SYSTEM_PROMPT = """Você é um especialista em microbiologia de lodos ativados da norma CETESB L1.025.
+
+MISSÃO: Analisar imagens de microscópio de lodo ativado e identificar organismos indicadores conforme a Tabela 6 da L1.025.
+
+CHAVES VÁLIDAS para o campo "chave" (use EXATAMENTE uma delas):
+flagelados, flagelados_rizopodes, ciliados_pedunculados, ciliados_livres, arcella,
+aspidisca, trachelophyllum, vorticella_microstoma, aelosoma, rotiferos, filamentos,
+nematoides, rizopodes_amebas, flocos_bons, flocos_dispersos, cianobacterias, protozoa_livre
+
+REGRA CRÍTICA: organismos[] NUNCA pode ser vazio. Se a imagem for de baixa qualidade,
+identifique ao menos flocos (flocos_bons ou flocos_dispersos) com confiança baixa (0.3).
+
+ESTRATÉGIA PARA IMAGENS DIFÍCEIS:
+- Imagem turva/escura → "flocos_dispersos", confiança 0.4
+- Partículas visíveis → "flocos_bons" ou "flocos_dispersos"
+- Estruturas alongadas → "filamentos"
+- Organismos com cílios/movimento → "ciliados_livres" ou "ciliados_pedunculados"
+- Em dúvida → escolha a chave mais próxima com confiança 0.3–0.5
+
+Retorne SOMENTE JSON puro, sem markdown, sem texto fora do JSON:
+{
+  "organismos": [
+    {
+      "chave": "chave_valida",
+      "nome": "Nome científico ou comum",
+      "grupo": "Grupo taxonômico",
+      "descricao": "O que foi observado na imagem",
+      "confianca": 0.0
+    }
+  ],
+  "qualidade_imagem": "boa|regular|ruim",
+  "observacoes_gerais": "Observação geral sobre o estado do lodo"
+}"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CHAMADA À API GEMINI — com rotação de chaves e retry
+# ──────────────────────────────────────────────────────────────────────────────
+def _chamar_gemini(frames_b64: list, params_dia: dict) -> dict:
+    chaves = _carregar_chaves_gemini()
+    if not chaves:
+        raise RuntimeError("Nenhuma chave GOOGLE_API_KEY encontrada nos Secrets do Streamlit.")
+
+    # Contexto operacional para enriquecer a análise
+    ctx = ""
+    if params_dia:
+        ctx = "\n\nParâmetros operacionais do dia:\n"
+        for k, v in params_dia.items():
+            if v:
+                ctx += f"  - {k}: {v}\n"
+        ctx += "\nConsidere esses valores ao interpretar os organismos encontrados."
+
+    # Monta partes da mensagem (imagens + texto)
+    parts = []
+    for b64 in frames_b64:
+        b64_comprimido = _comprimir_b64(b64)
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": b64_comprimido}})
+    parts.append({"text": (
+        f"Analise estas imagens de microscópio de lodo ativado de ETE.{ctx}\n\n"
+        "IMPORTANTE: Identifique todos os organismos/estruturas visíveis conforme CETESB L1.025.\n"
+        "Retorne SOMENTE JSON puro conforme as instruções."
+    )})
+
+    payload = {
+        "system_instruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
+        "contents":           [{"parts": parts}],
+        "generationConfig":   {"temperature": 0.1, "maxOutputTokens": 1000},
+    }
+
+    url_base = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key="
+    chaves_esgotadas = set()
+    idx = 0
+    retries_servidor = 0
+    MAX_503 = 3
+
+    while True:
+        # Pula chaves com cota diária esgotada
+        tentativas = 0
+        while idx in chaves_esgotadas:
+            idx = (idx + 1) % len(chaves)
+            tentativas += 1
+            if tentativas >= len(chaves):
+                raise RuntimeError(
+                    f"COTA_DIARIA_ESGOTADA: todas as {len(chaves)} chaves atingiram o limite diário.\n"
+                    "Aguarde o reset às 04:00 BRT ou adicione mais chaves nos Secrets."
+                )
+
+        try:
+            resp = requests.post(
+                url_base + chaves[idx],
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=90,
+            )
+
+            if resp.status_code == 429:
+                corpo = ""
+                try:
+                    corpo = str(resp.json()).lower()
+                except Exception:
+                    corpo = resp.text.lower()
+
+                if "daily" in corpo or "per_day" in corpo:
+                    # Cota diária — marca chave e tenta próxima
+                    chaves_esgotadas.add(idx)
+                    idx = (idx + 1) % len(chaves)
+                    _time.sleep(1)
+                    continue
+                else:
+                    # Rate limit por minuto — não é fatal
+                    raise RuntimeError("RATE_LIMIT_MIN")
+
+            if resp.status_code == 503:
+                retries_servidor += 1
+                if retries_servidor <= MAX_503:
+                    espera = 5 * retries_servidor
+                    st.toast(f"Servidor ocupado, aguardando {espera}s... ({retries_servidor}/{MAX_503})")
+                    _time.sleep(espera)
+                    continue
+                resp.raise_for_status()
+
+            resp.raise_for_status()
+            break
+
+        except requests.exceptions.Timeout:
+            retries_servidor += 1
+            if retries_servidor <= MAX_503:
+                st.toast(f"Timeout — tentando novamente ({retries_servidor}/{MAX_503})...")
+                _time.sleep(5)
+                continue
+            raise
+
+    # Parse da resposta
+    try:
+        texto = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        return {"organismos": [], "qualidade_imagem": "ruim",
+                "observacoes_gerais": f"Resposta inesperada: {str(resp.json())[:200]}"}
+
+    texto = texto.strip()
+    for m in ["```json", "```JSON", "```"]:
+        texto = texto.replace(m, "")
+    texto = texto.strip()
+
+    try:
+        return json.loads(texto)
+    except json.JSONDecodeError:
+        match = re.search(r'\{.*\}', texto, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except Exception:
+                pass
+        return {"organismos": [], "qualidade_imagem": "ruim",
+                "observacoes_gerais": f"Erro ao parsear JSON. Texto: {texto[:300]}"}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DIAGNÓSTICO CETESB — pontuação ponderada por confiança
+# ──────────────────────────────────────────────────────────────────────────────
+def _diagnostico_cetesb(organismos: list) -> dict:
+    if not organismos:
+        return {
+            "qualidade":   "indeterminada",
+            "descricao":   "Nenhum organismo identificado.",
+            "cor":         _COR["cinza"],
+            "acoes":       ["Repetir análise com imagens de melhor qualidade."],
+        }
+
+    chaves = {o.get("chave", "") for o in organismos}
+    conf_map = {}
+    for o in organismos:
+        ch = o.get("chave", "")
+        conf_map[ch] = max(conf_map.get(ch, 0), o.get("confianca", 0.5))
+
+    # Regras absolutas
+    if "cianobacterias" in chaves:
+        return {"qualidade": "critico", "cor": _COR["vermelho"],
+                "descricao": "Cianobactérias detectadas — risco de toxicidade.",
+                "acoes": ["Verificar origem do afluente.", "Alertar equipe de operação imediatamente."]}
+
+    if "flocos_dispersos" in chaves and "flocos_bons" not in chaves:
+        return {"qualidade": "ruim", "cor": _COR["vermelho"],
+                "descricao": "Lodo totalmente disperso (pin-point) — má sedimentação.",
+                "acoes": ["Verificar θc.", "Investigar tóxicos no afluente."]}
+
+    # Score ponderado
+    score = sum(_PESO_CETESB.get(ch, 0) * conf for ch, conf in conf_map.items())
+
+    acoes = []
+    if "filamentos" in chaves:
+        acoes.append("Monitorar IVL — filamentos presentes, avaliar risco de bulking.")
+    if "flagelados" in chaves:
+        acoes.append("Verificar OD no tanque — flagelados indicam deficiência de aeração.")
+    if "vorticella_microstoma" in chaves:
+        acoes.append("Investigar sobrecarga, tóxicos ou aeração insuficiente.")
+    if "aelosoma" in chaves:
+        acoes.append("OD possivelmente elevado (>6 mg/L) — reduzir aeração.")
+
+    if score >= 3:
+        return {"qualidade": "boa", "cor": _COR["verde"],
+                "descricao": "Sistema estável com organismos indicadores de boa depuração.",
+                "acoes":     acoes or ["Manter parâmetros operacionais."]}
+    elif score >= 0:
+        return {"qualidade": "regular", "cor": _COR["laranja"],
+                "descricao": "Sistema em equilíbrio — organismos mistos, monitorar evolução.",
+                "acoes":     acoes or ["Verificar idade do lodo e parâmetros operacionais."]}
+    elif score >= -2:
+        return {"qualidade": "ruim", "cor": _COR["vermelho"],
+                "descricao": "Organismos indicadores de problema — verificar operação.",
+                "acoes":     acoes or ["Verificar OD, carga orgânica e θc."]}
+    else:
+        return {"qualidade": "critico", "cor": _COR["vermelho"],
+                "descricao": "Múltiplos indicadores negativos — problema sério no sistema.",
+                "acoes":     acoes or ["Acionar equipe técnica para revisão completa."]}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GERADOR DE RELATÓRIO COMPLETO (texto copiável)
+# ──────────────────────────────────────────────────────────────────────────────
+def _gerar_relatorio(organismos: list, diag: dict, params_dia: dict, confianca_media: float) -> str:
+    from datetime import datetime, timezone, timedelta
+    BRT = timezone(timedelta(hours=-3))
+    agora = datetime.now(BRT).strftime("%d/%m/%Y %H:%M")
+
+    linhas = [
+        "=" * 52,
+        "   RELATÓRIO MICROBIOLÓGICO — LODO ATIVADO",
+        f"   Data/Hora: {agora}",
+        "   Norma: CETESB L1.025 + IA (Gemini)",
+        "=" * 52,
+        "",
+        f"QUALIDADE DO PROCESSO: {diag['qualidade'].upper()}",
+        f"Diagnóstico: {diag['descricao']}",
+        f"Confiança média da análise: {confianca_media*100:.0f}%",
+        "",
+    ]
+
+    if params_dia:
+        linhas.append("PARÂMETROS DO DIA:")
+        for k, v in params_dia.items():
+            if v:
+                linhas.append(f"  {k}: {v}")
+        linhas.append("")
+
+    linhas.append(f"MICRORGANISMOS IDENTIFICADOS ({len(organismos)}):")
+    for o in organismos:
+        conf_pct = int(o.get("confianca", 0) * 100)
+        meta = _MICRO_TABELA6.get(o.get("chave", ""), {})
+        linhas.append(f"  • {o.get('nome','?')} ({o.get('grupo','')})")
+        linhas.append(f"    Observação: {o.get('descricao','')}")
+        if meta.get("condicao"):
+            linhas.append(f"    Indicação CETESB: {meta['condicao']}")
+        linhas.append(f"    Confiança da IA: {conf_pct}%")
+        linhas.append("")
+
+    linhas.append("DIAGNÓSTICO CETESB L1.025 (Tabela 6):")
+    chaves_unicas = list({o.get("chave", "") for o in organismos if o.get("chave") in _MICRO_TABELA6})
+    for ch in chaves_unicas:
+        meta = _MICRO_TABELA6[ch]
+        semaforo = {"verde": "[✓]", "laranja": "[!]", "vermelho": "[✗]"}.get(meta["semaforo"], "[-]")
+        linhas.append(f"  {semaforo} {meta['condicao']}")
+        if meta["semaforo"] != "verde":
+            linhas.append(f"      → {meta['recomendacao']}")
+    linhas.append("")
+
+    linhas.append("AÇÕES RECOMENDADAS:")
+    for acao in diag["acoes"]:
+        linhas.append(f"  • {acao}")
+    linhas.append("")
+    linhas.append("Análise gerada por IA + regras CETESB L1.025")
+    linhas.append("Confirme sempre com análise laboratorial qualificada.")
+
+    return "\n".join(linhas)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INTERFACE PRINCIPAL — render_microbiologia()
+# ──────────────────────────────────────────────────────────────────────────────
+def render_microbiologia():
+    st.markdown(
+        '<hr style="border:none;border-top:1px solid var(--border);margin:2rem 0 1.5rem;">',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="ete-section-label">'
+        '<div class="ete-section-dot"></div>'
+        '<span>Microbiologia do Lodo — Análise por IA (CETESB L1.025)</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Suba fotos ou vídeo do microscópio. "
+        "A IA identifica os organismos e gera relatório conforme a Tabela 6 da L1.025."
+    )
+
+    # Widget de cota
+    _cota_widget()
+
+    # Parâmetros do dia (contexto para enriquecer o prompt)
+    params_dia = {}
+    for kws, label in [
+        (["ph mbbr", "ph mab"],            "pH"),
+        (["oxigenac", "oxigenação"],        "OD Nitrificação"),
+        (["sst nitrif"],                    "SST Nitrificação"),
+        (["dqo saida", "dqo saída"],        "DQO Saída"),
+    ]:
+        for col in df.columns:
+            if any(k in _strip_accents(col.lower()) for k in kws):
+                v = last_valid_raw(df, col)
+                if v:
+                    params_dia[label] = str(v)
+                    break
+
+    if params_dia:
+        st.caption("Parâmetros do último registro (usados como contexto para a IA):")
+        cols_p = st.columns(len(params_dia))
+        for i, (k, v) in enumerate(params_dia.items()):
+            cols_p[i].metric(k, v)
+
+    # ── Seleção do modo de upload ──────────────────────────────────────────────
+    st.subheader("Upload de Imagens ou Vídeo do Microscópio")
+    modo = st.radio(
+        "Formato:",
+        ["📷 Fotos (JPG/PNG)", "🎥 Vídeo (MP4/MOV)"],
+        horizontal=True,
+        key="micro_modo_upload",
+    )
+
+    frames_b64: list = []
+
+    if "Fotos" in modo:
+        imgs = st.file_uploader(
+            "Selecione até 3 fotos do microscópio",
+            type=["jpg", "jpeg", "png", "bmp", "tiff"],
+            accept_multiple_files=True,
+            key="micro_upload_fotos",
+            help="O sistema usa as 2 primeiras imagens para economizar cota da API.",
+        )
+        if imgs:
+            frames_b64 = [base64.b64encode(img.read()).decode() for img in imgs[:2]]
+            cols = st.columns(min(len(frames_b64), 2))
+            for i, b64 in enumerate(frames_b64):
+                cols[i].image(base64.b64decode(b64), caption=f"Imagem {i+1}", use_container_width=True)
+
+    else:
+        video_file = st.file_uploader(
+            "Selecione o vídeo (.mp4, .mov, .avi)",
+            type=["mp4", "mov", "avi", "webm", "mkv"],
+            key="micro_upload_video",
+        )
+        if video_file is not None:
+            st.video(video_file)
+            video_file.seek(0)
+            video_bytes = video_file.read()
+            st.caption(f"Tamanho: {len(video_bytes)/(1024*1024):.1f} MB")
+            with st.spinner("Extraindo frames do vídeo..."):
+                try:
+                    frames_b64 = _extrair_frames_video(video_bytes)
+                    if frames_b64:
+                        st.success(f"{len(frames_b64)} frame(s) extraído(s).")
+                        cols = st.columns(min(len(frames_b64), 2))
+                        for i, b64 in enumerate(frames_b64):
+                            cols[i].image(base64.b64decode(b64), caption=f"Frame {i+1}", use_container_width=True)
+                    else:
+                        st.error("Não foi possível extrair frames. Use o modo Fotos.")
+                except Exception as e:
+                    st.error(f"ffmpeg indisponível neste servidor. Use o modo Fotos.\n\nDetalhe: {e}")
+
+    # ── Botão de análise ───────────────────────────────────────────────────────
+    if frames_b64:
+        if st.button("🔬 Analisar com IA + Regras CETESB", type="primary", use_container_width=True):
+
+            if not _carregar_chaves_gemini():
+                st.error("Chave GOOGLE_API_KEY não encontrada nos Secrets do Streamlit.")
+                st.stop()
+
+            with st.status("Analisando imagens...", expanded=True) as status_box:
+                try:
+                    st.write(f"🤖 Enviando {len(frames_b64)} imagem(ns) para o Gemini...")
+                    resultado = _chamar_gemini(frames_b64, params_dia)
+                    _cota_incrementar()
+
+                    organismos = resultado.get("organismos", [])
+                    qualidade  = resultado.get("qualidade_imagem", "regular")
+                    obs        = resultado.get("observacoes_gerais", "")
+
+                    if not organismos:
+                        st.warning(
+                            "A IA não identificou organismos nesta imagem. "
+                            "Tente com foto mais nítida (melhor iluminação e foco)."
+                        )
+
+                    st.write("📋 Aplicando regras CETESB L1.025 (Tabela 6)...")
+                    diag = _diagnostico_cetesb(organismos)
+
+                    confianca_media = (
+                        sum(o.get("confianca", 0) for o in organismos) / len(organismos)
+                        if organismos else 0.0
+                    )
+
+                    st.session_state["micro_resultado"] = {
+                        "organismos":      organismos,
+                        "qualidade_img":   qualidade,
+                        "obs_gerais":      obs,
+                        "diag":            diag,
+                        "confianca_media": confianca_media,
+                        "params_dia":      params_dia,
+                    }
+                    status_box.update(label="✅ Análise concluída!", state="complete")
+
+                except RuntimeError as e:
+                    msg = str(e)
+                    if "COTA_DIARIA_ESGOTADA" in msg:
+                        st.warning(
+                            "⚠️ **Cota diária da API esgotada em todas as chaves.**\n\n"
+                            "Aguarde o reset às **04:00 BRT** ou adicione mais chaves "
+                            "(`GOOGLE_API_KEY_2`, `_3`...) nos Secrets do Streamlit."
+                        )
+                    elif "RATE_LIMIT_MIN" in msg:
+                        st.warning(
+                            "⏳ **Muitas requisições por minuto.**\n\n"
+                            "Aguarde **1 minuto** e tente novamente. "
+                            "Isso não consome sua cota diária."
+                        )
+                    else:
+                        st.error(f"Erro: {msg}")
+                    st.stop()
+                except Exception as e:
+                    st.error(f"Erro inesperado: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                    st.stop()
+
+    # ── Exibição dos resultados ────────────────────────────────────────────────
+    r = st.session_state.get("micro_resultado")
+    if not r:
+        st.info(
+            "Faça upload de imagens do microscópio e clique em **Analisar** "
+            "para ver o diagnóstico microbiológico."
+        )
+        return
+
+    organismos      = r["organismos"]
+    qualidade_img   = r["qualidade_img"]
+    obs_gerais      = r["obs_gerais"]
+    diag            = r["diag"]
+    confianca_media = r["confianca_media"]
+    params_dia_r    = r["params_dia"]
+
+    # Aviso de qualidade da imagem
+    if qualidade_img == "ruim":
+        st.info("💡 Qualidade de imagem baixa — confiança reduzida, mas análise realizada com o disponível.")
+    elif qualidade_img == "regular":
+        st.info("Qualidade regular das imagens.")
+
+    if obs_gerais:
+        st.caption(f"Observação da IA: {obs_gerais}")
+
+    if not organismos:
+        st.warning("Nenhum organismo identificado com as imagens fornecidas.")
+        if st.button("🔄 Limpar e tentar novamente", key="micro_btn_limpar_vazio"):
+            del st.session_state["micro_resultado"]
+            st.rerun()
+        return
+
+    # ── Métricas resumo ────────────────────────────────────────────────────────
+    st.subheader("Resumo da Análise")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Organismos identificados", len(organismos))
+    m2.metric("Confiança média",          f"{confianca_media*100:.0f}%")
+    m3.metric("Qualidade da imagem",      qualidade_img.capitalize())
+
+    # ── Card de qualidade do processo ─────────────────────────────────────────
+    st.subheader("Qualidade Estimada do Lodo / Processo")
+    cor   = diag["cor"]
+    qual  = diag["qualidade"].upper()
+    desc  = diag["descricao"]
+    st.markdown(
+        f"""<div style="background:{cor};border-radius:10px;padding:16px 20px;
+                        margin-bottom:12px;color:white;">
+            <div style="font-size:18px;font-weight:700">Qualidade: {qual}</div>
+            <div style="font-size:13px;margin-top:6px;opacity:0.92">{desc}</div>
+            <div style="font-size:11px;margin-top:8px;opacity:0.75;font-family:monospace">
+                Análise: IA Gemini + Tabela 6 CETESB L1.025
+            </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # Ações recomendadas
+    with st.expander("📋 Ações Recomendadas", expanded=True):
+        for a in diag["acoes"]:
+            st.markdown(f"• {a}")
+
+    # ── Cards de organismos ────────────────────────────────────────────────────
+    st.subheader(f"Organismos Detectados ({len(organismos)})")
+    cols_org = st.columns(2)
+    for i, o in enumerate(organismos):
+        meta  = _MICRO_TABELA6.get(o.get("chave", ""), {"semaforo": "cinza", "condicao": "", "recomendacao": ""})
+        cor_o = _COR.get(meta.get("semaforo", "cinza"), _COR["cinza"])
+        conf  = o.get("confianca", 0.0)
+        barra = "█" * int(conf * 10) + "░" * (10 - int(conf * 10))
+        icon  = {"verde": "✅", "laranja": "⚠️", "vermelho": "🔴", "cinza": "🔍"}.get(meta.get("semaforo", "cinza"), "🔍")
+        with cols_org[i % 2]:
+            st.markdown(
+                f"""<div style="background:{cor_o};border-radius:8px;padding:12px 14px;
+                                margin-bottom:8px;color:white;">
+                    <div style="font-size:15px;font-weight:500">{icon} {o.get('nome','—')}</div>
+                    <div style="font-size:11px;opacity:0.85">{o.get('grupo','')}</div>
+                    <div style="font-size:12px;margin-top:6px">{o.get('descricao','')}</div>
+                    {'<div style="font-size:11px;margin-top:4px;opacity:0.85">📋 ' + meta['condicao'] + '</div>'
+                      if meta.get('condicao') else ''}
+                    <div style="font-size:11px;margin-top:6px;opacity:0.8">
+                        🎯 Confiança: {barra} {conf*100:.0f}%
+                    </div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+    # ── Diagnóstico pela Tabela 6 ──────────────────────────────────────────────
+    st.subheader("Diagnóstico CETESB L1.025 — Tabela 6")
+    chaves_unicas = list({o.get("chave", "") for o in organismos if o.get("chave") in _MICRO_TABELA6})
+
+    for ch in chaves_unicas:
+        meta = _MICRO_TABELA6[ch]
+        if meta["semaforo"] == "vermelho":
+            st.error(f"**{meta['condicao']}**\n\n→ {meta['recomendacao']}")
+        elif meta["semaforo"] == "laranja":
+            st.warning(f"**{meta['condicao']}**\n\n→ {meta['recomendacao']}")
+        else:
+            st.success(f"**{meta['condicao']}**")
+
+    # ── Relatório copiável ─────────────────────────────────────────────────────
+    st.subheader("Relatório Completo — Copiar para WhatsApp / Laudo")
+    relatorio = _gerar_relatorio(organismos, diag, params_dia_r, confianca_media)
+    st.text_area(
+        "Selecione tudo (Ctrl+A) e copie (Ctrl+C):",
+        value=relatorio,
+        height=300,
+        key="micro_ta_relatorio",
+        label_visibility="collapsed",
+    )
+    st.caption("Ctrl+A → Ctrl+C para copiar o relatório completo.")
+
+    if st.button("🔄 Limpar e analisar novamente", key="micro_btn_limpar"):
+        del st.session_state["micro_resultado"]
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CHAMADA — adicione esta linha no final do seu app.py
+# ──────────────────────────────────────────────────────────────────────────────
+render_microbiologia()
