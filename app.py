@@ -1406,7 +1406,7 @@ def _calcular_nitidez_laplaciano(frame_bytes: bytes) -> float:
         return 0.0
 
 
-def _extrair_frames_video(video_bytes: bytes, max_frames: int = 2) -> list:
+def _extrair_frames_video(video_bytes: bytes, max_frames: int = 8) -> list:
     """
     Extrai entre 1 e `max_frames` frames do vídeo usando ffmpeg.
     Aplica filtro de qualidade (Laplaciano) para selecionar apenas frames nítidos.
@@ -1473,7 +1473,7 @@ def _extrair_frames_video(video_bytes: bytes, max_frames: int = 2) -> list:
     return [b64 for _, b64 in melhores]
 
 
-def _selecionar_melhores_imagens(imagens_bytes: list, max_frames: int = 2) -> list:
+def _selecionar_melhores_imagens(imagens_bytes: list, max_frames: int = 8) -> list:
     """
     Para imagens estáticas (JPG/PNG), aplica filtro de nitidez e retorna as melhores.
 
