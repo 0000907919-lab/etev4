@@ -1867,7 +1867,7 @@ def render_microbiologia():
         if imagens:
             todas_bytes = [img.read() for img in imagens]
 
-            # Aplica filtro de qualidade — seleciona até 2 melhores
+            # Aplica filtro de qualidade — seleciona até 8 melhores
             with st.spinner("🔍 Selecionando frames mais nítidos..."):
                 frames_b64 = _selecionar_melhores_imagens(todas_bytes, max_frames=2)
 
