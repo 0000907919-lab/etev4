@@ -1294,7 +1294,7 @@ st.caption("Selecione e copie o texto acima (Ctrl+C / Cmd+C) para colar no Whats
 # =============================================================================
 #        MICROBIOLOGIA — ANÁLISE DE VÍDEO VIA IA + REGRAS CETESB L1.025
 #        Melhorias implementadas:
-#          1. Extração de 1-2 frames com filtro de qualidade (Laplaciano)
+#          1. Extração de 1-8 frames com filtro de qualidade (Laplaciano)
 #          2. Prompt estruturado para resposta JSON robusta
 #          3. Agregação de resultados por voto majoritário
 #          4. Pós-processamento baseado em regras CETESB
