@@ -1510,7 +1510,7 @@ def _selecionar_melhores_imagens(imagens_bytes: list, max_frames: int = 2) -> li
 def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: str = None) -> dict:
     """
     Chama a API Google Gemini Vision com os frames selecionados.
-    Usa o modelo gemini-2.5-flash. Envia TODOS os frames numa única requisição
+    Usa o modelo gemini-1.5-flash. Envia TODOS os frames numa única requisição
     para economizar cota (limite gratuito: 5 RPM).
     Implementa rotação entre múltiplas chaves API e retry com backoff exponencial
     para contornar erros 503 (sobrecarga) e 429 (rate limit).
