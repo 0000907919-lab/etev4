@@ -5,7 +5,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import matplotlib.pyplot as plt
-import io, requests, re
+import io, requests, re, time, itertools
 from matplotlib.ticker import FuncFormatter
 
 # =========================
@@ -1332,7 +1332,17 @@ MICRO_TABELA6 = {
 COR_SEMAFORO = {"verde": "#43A047", "laranja": "#FB8C00", "vermelho": "#E53935", "cinza": "#546E7A"}
 
 # Chave da API lida dos secrets do Streamlit
-GOOGLE_API_KEY_MICRO = st.secrets.get("GOOGLE_API_KEY", "") if hasattr(st, "secrets") else ""
+_secrets = st.secrets if hasattr(st, "secrets") else {}
+GOOGLE_API_KEY_MICRO = _secrets.get("GOOGLE_API_KEY", "")
+
+# Suporte a múltiplas chaves (GOOGLE_API_KEY_1, _2, _3) para rotação e bypass de rate limit
+_raw_keys = [
+    _secrets.get("GOOGLE_API_KEY_1", ""),
+    _secrets.get("GOOGLE_API_KEY_2", ""),
+    _secrets.get("GOOGLE_API_KEY_3", ""),
+]
+GOOGLE_API_KEYS = [k for k in _raw_keys if k] or ([GOOGLE_API_KEY_MICRO] if GOOGLE_API_KEY_MICRO else [])
+_api_key_cycle = itertools.cycle(GOOGLE_API_KEYS) if GOOGLE_API_KEYS else None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROMPT ESTRUTURADO — Versão melhorada com instrução de JSON estrito
@@ -1497,17 +1507,18 @@ def _selecionar_melhores_imagens(imagens_bytes: list, max_frames: int = 2) -> li
 # 2. INTEGRAÇÃO COM IA — chamada à API com tratamento de erro robusto
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: str) -> dict:
+def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: str = None) -> dict:
     """
     Chama a API Google Gemini Vision com os frames selecionados.
     Usa o modelo gemini-2.5-flash. Envia TODOS os frames numa única requisição
     para economizar cota (limite gratuito: 5 RPM).
-    Implementa tratamento de erro robusto para JSON inválido.
+    Implementa rotação entre múltiplas chaves API e retry com backoff exponencial
+    para contornar erros 503 (sobrecarga) e 429 (rate limit).
 
     Args:
         frames_b64: Lista de imagens em base64
         params_operacionais: Parâmetros do dia para contexto
-        api_key: Chave da API Google (GOOGLE_API_KEY)
+        api_key: ignorado (mantido por compatibilidade) — usa GOOGLE_API_KEYS global
 
     Returns:
         Dicionário com resultado parseado ou dict com erro em caso de falha
@@ -1538,15 +1549,39 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
         })
     parts.append({"text": prompt_usuario})
 
-    # Chama a API Gemini (REST)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-    resp = requests.post(
-        url,
-        headers={"Content-Type": "application/json"},
-        json={"contents": [{"parts": parts}]},
-        timeout=90
-    )
-    resp.raise_for_status()
+    # Chama a API Gemini (REST) com rotação de chaves e retry com backoff
+    if not GOOGLE_API_KEYS:
+        raise ValueError("Nenhuma chave GOOGLE_API_KEY configurada nos Secrets.")
+
+    MAX_TENTATIVAS = max(len(GOOGLE_API_KEYS) * 2, 4)
+    resp = None
+    for tentativa in range(MAX_TENTATIVAS):
+        chave_atual = next(_api_key_cycle)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={chave_atual}"
+        try:
+            resp = requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"parts": parts}]},
+                timeout=90
+            )
+        except requests.exceptions.Timeout:
+            espera = 2 ** (tentativa // len(GOOGLE_API_KEYS))
+            st.warning(f"⏳ Timeout na tentativa {tentativa+1}/{MAX_TENTATIVAS}. Aguardando {espera}s antes de tentar nova chave...")
+            time.sleep(espera)
+            continue
+
+        if resp.status_code in (503, 429):
+            espera = 2 ** (tentativa // len(GOOGLE_API_KEYS))  # 1s, 2s, 4s, 8s
+            motivo = "sobrecarga (503)" if resp.status_code == 503 else "rate limit (429)"
+            st.warning(f"⏳ Gemini com {motivo} — tentativa {tentativa+1}/{MAX_TENTATIVAS}. Trocando chave e aguardando {espera}s...")
+            time.sleep(espera)
+            continue
+
+        resp.raise_for_status()
+        break
+    else:
+        resp.raise_for_status()
 
     data = resp.json()
 
@@ -1871,19 +1906,19 @@ def render_microbiologia():
         analisar = st.button("🔬 Analisar com IA + Regras CETESB", type="primary", use_container_width=True)
 
         if analisar:
-            api_key_input = GOOGLE_API_KEY_MICRO
-            if not api_key_input:
-                st.error("❌ Chave API Google não configurada. Adicione GOOGLE_API_KEY nos Secrets do Streamlit.")
+            if not GOOGLE_API_KEYS:
+                st.error("❌ Nenhuma chave API Google configurada. Adicione GOOGLE_API_KEY (ou GOOGLE_API_KEY_1/2/3) nos Secrets do Streamlit.")
                 st.stop()
 
             with st.status("Analisando frames selecionados...", expanded=True) as status_micro:
                 try:
-                    st.write(f"🤖 Enviando {len(frames_b64)} frame(s) numa única requisição (economiza cota)...")
+                    n_chaves = len(GOOGLE_API_KEYS)
+                    st.write(f"🤖 Enviando {len(frames_b64)} frame(s) numa única requisição (economiza cota) — {n_chaves} chave(s) disponível(is)...")
 
                     # Envia TODOS os frames juntos numa única chamada à API
                     # Evita múltiplas requisições — importante com limite de 5 RPM
                     resultado_unico = _chamar_gemini_micro(
-                        frames_b64, params_filtrados, api_key_input
+                        frames_b64, params_filtrados
                     )
                     resultados_por_frame = [resultado_unico] if not resultado_unico.get("_erro_parse") else []
                     resultado_consolidado = _agregar_resultados(resultados_por_frame)
