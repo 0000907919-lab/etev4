@@ -1347,34 +1347,70 @@ _api_key_cycle = itertools.cycle(GOOGLE_API_KEYS) if GOOGLE_API_KEYS else None
 # ──────────────────────────────────────────────────────────────────────────────
 # PROMPT ESTRUTURADO — Versão melhorada com instrução de JSON estrito
 # ──────────────────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT_MICRO = """Você é um especialista em microbiologia de sistemas de lodos ativados, seguindo a Norma Técnica CETESB L1.025.
-Analise as imagens de microscópio fornecidas e identifique microrganismos visíveis.
+SYSTEM_PROMPT_MICRO = """Você é um microbiologista sênior especializado em sistemas de lodos ativados, com profundo conhecimento da Norma Técnica CETESB L1.025 e da literatura internacional de biologia de lodos (Wanner, Jenkins, Gerardi).
 
-Para cada organismo ou grupo identificado, classifique usando EXATAMENTE uma dessas chaves:
+Sua missão: analisar imagens de microscópio de lodo ativado e gerar um laudo microbiológico completo, técnico e acionável — equivalente ao que um operador experiente receberia de um laboratório de referência.
+
+═══ CHAVES PERMITIDAS (use EXATAMENTE uma dessas por organismo) ═══
 flagelados, flagelados_rizopodes, ciliados_pedunculados, ciliados_livres, arcella, aspidisca,
 trachelophyllum, vorticella_microstoma, aelosoma, rotiferos, filamentos, nematoides,
 rizopodes_amebas, flocos_bons, flocos_dispersos, cianobacterias, protozoa_livre
 
-REGRAS IMPORTANTES:
-1. Responda APENAS com JSON válido, sem texto antes ou depois, sem markdown, sem blocos de código
-2. Não use aspas dentro de strings — use apenas aspas duplas no JSON
-3. Se a imagem for de baixa qualidade, indique nos campos e liste o que conseguiu observar
-4. Estime uma confiança (0.0 a 1.0) para cada organismo identificado
+═══ INSTRUÇÕES DE ANÁLISE ═══
 
-Formato OBRIGATÓRIO da resposta (JSON puro):
+Para CADA organismo identificado:
+- Descreva morfologia específica (tamanho estimado em µm, formato, mobilidade, coloração aparente)
+- Indique abundância relativa: raro (<5 por campo), ocasional (5-20), frequente (>20 por campo)
+- Relacione com o parâmetro operacional mais relevante (OD, IVL, θc, carga orgânica)
+- Aponte o que a PRESENÇA desse organismo significa NESTE momento operacional
+
+Para a análise do FLOCO:
+- Estrutura (compacto/disperso/irregular/filamentoso)
+- Tamanho médio estimado (µm)
+- Presença de material inerte, coloração escura, lodo intumescido
+- Relação floco/fundo (clareza do líquido entre flocos)
+
+Para a análise de FILAMENTOS (se houver):
+- Morfologia (retos, curvos, com ramificações, com bainhas)
+- Posição (protruindo do floco ou internos)
+- Estimativa de intensidade: leve/moderada/severa (potencial de bulking)
+- Possível gênero (Microthrix, Nocardia, Thiothrix, tipo 021N, etc.)
+
+Nos "alertas_cruzados": correlacione o que viu com os parâmetros operacionais informados.
+Exemplos: "OD baixo (X mg/L) favorece filamentos e flagelados — consistente com achado";
+"θc estimada pelo biota sugere lodo jovem — verificar relação A/M".
+
+═══ FORMATO OBRIGATÓRIO (JSON puro, sem markdown, sem texto extra) ═══
 {
   "organismos": [
     {
       "chave": "chave_da_tabela",
-      "nome": "nome cientifico ou grupo",
-      "grupo": "grupo taxonomico",
-      "descricao": "o que foi observado na imagem",
+      "nome": "nome científico ou grupo (ex: Vorticella convallaria, Arcella sp.)",
+      "grupo": "grupo taxonômico (ex: Protozoário ciliado séssil)",
+      "descricao": "descrição morfológica detalhada observada na imagem",
+      "abundancia": "raro|ocasional|frequente",
+      "significado_operacional": "o que a presença deste organismo indica sobre o processo",
       "confianca": 0.85
     }
   ],
+  "analise_floco": {
+    "estrutura": "compacto|disperso|irregular|filamentoso",
+    "tamanho_estimado_um": 300,
+    "observacoes": "descrição detalhada do floco e da fase líquida"
+  },
+  "filamentos": {
+    "presentes": true,
+    "intensidade": "leve|moderada|severa|ausente",
+    "morfologia": "descrição dos filamentos se presentes",
+    "genero_provavel": "Microthrix parvicella (se identificável)"
+  },
+  "alertas_cruzados": [
+    "Correlação 1 entre biota e parâmetros operacionais informados",
+    "Correlação 2 — tendência esperada se parâmetro não for ajustado"
+  ],
   "qualidade_imagem": "boa|regular|ruim",
   "nitidez_score": 0.75,
-  "observacoes_gerais": "observacoes sobre as imagens"
+  "observacoes_gerais": "síntese técnica do que foi observado no conjunto das imagens"
 }"""
 
 
@@ -1553,11 +1589,17 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
     if not GOOGLE_API_KEYS:
         raise ValueError("Nenhuma chave GOOGLE_API_KEY configurada nos Secrets.")
 
-    MAX_TENTATIVAS = max(len(GOOGLE_API_KEYS) * 2, 4)
-    resp = None
+    n_chaves = len(GOOGLE_API_KEYS)
+    # Backoff: 2s, 4s, 8s, 16s, 32s — cresce com o número de tentativas, não com o índice de chave
+    BACKOFF_BASE = 2
+    MAX_TENTATIVAS = max(n_chaves * 3, 6)
+    ultimo_status = None
+    ultimo_erro = None
+
     for tentativa in range(MAX_TENTATIVAS):
         chave_atual = next(_api_key_cycle)
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={chave_atual}"
+
         try:
             resp = requests.post(
                 url,
@@ -1566,21 +1608,60 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
                 timeout=90
             )
         except requests.exceptions.Timeout:
-            espera = 2 ** (tentativa // len(GOOGLE_API_KEYS))
-            st.warning(f"⏳ Timeout na tentativa {tentativa+1}/{MAX_TENTATIVAS}. Aguardando {espera}s antes de tentar nova chave...")
+            espera = BACKOFF_BASE ** min(tentativa, 4)
+            st.warning(f"⏳ Timeout (tentativa {tentativa+1}/{MAX_TENTATIVAS}). Nova chave em {espera}s...")
+            time.sleep(espera)
+            ultimo_erro = "Timeout"
+            continue
+        except requests.exceptions.RequestException as e:
+            espera = BACKOFF_BASE ** min(tentativa, 4)
+            st.warning(f"⏳ Erro de rede: {e} — tentativa {tentativa+1}/{MAX_TENTATIVAS}. Aguardando {espera}s...")
+            time.sleep(espera)
+            ultimo_erro = str(e)
+            continue
+
+        ultimo_status = resp.status_code
+
+        if resp.status_code == 200:
+            break  # sucesso — sai do loop
+
+        if resp.status_code in (429, 503, 529):
+            motivo = {429: "rate limit (429)", 503: "sobrecarga (503)", 529: "overloaded (529)"}.get(resp.status_code, str(resp.status_code))
+            # Verifica se a API informou um Retry-After
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    espera = int(retry_after)
+                except ValueError:
+                    espera = BACKOFF_BASE ** min(tentativa, 4)
+            else:
+                espera = BACKOFF_BASE ** min(tentativa, 4)
+            espera = min(espera, 60)  # nunca esperar mais de 60s
+            st.warning(f"⏳ Gemini {motivo} — chave rotacionada. Aguardando {espera}s... (tentativa {tentativa+1}/{MAX_TENTATIVAS})")
             time.sleep(espera)
             continue
 
-        if resp.status_code in (503, 429):
-            espera = 2 ** (tentativa // len(GOOGLE_API_KEYS))  # 1s, 2s, 4s, 8s
-            motivo = "sobrecarga (503)" if resp.status_code == 503 else "rate limit (429)"
-            st.warning(f"⏳ Gemini com {motivo} — tentativa {tentativa+1}/{MAX_TENTATIVAS}. Trocando chave e aguardando {espera}s...")
-            time.sleep(espera)
-            continue
+        if resp.status_code in (400, 401, 403):
+            # Erros permanentes — não faz sentido retrying com mesma chave
+            st.error(f"❌ Erro permanente da API Gemini: {resp.status_code} — {resp.text[:300]}")
+            raise requests.exceptions.HTTPError(response=resp)
 
-        resp.raise_for_status()
-        break
+        # Outros erros 5xx — tenta novamente
+        espera = BACKOFF_BASE ** min(tentativa, 4)
+        st.warning(f"⏳ Erro {resp.status_code} da API — tentativa {tentativa+1}/{MAX_TENTATIVAS}. Aguardando {espera}s...")
+        time.sleep(espera)
+
     else:
+        # Todas as tentativas falharam
+        msg = f"Todas as {MAX_TENTATIVAS} tentativas falharam."
+        if ultimo_status:
+            msg += f" Último status HTTP: {ultimo_status}."
+        if ultimo_erro:
+            msg += f" Último erro: {ultimo_erro}."
+        raise RuntimeError(msg)
+
+    # Se chegou aqui sem 200, ultima tentativa também falhou
+    if ultimo_status and ultimo_status != 200:
         resp.raise_for_status()
 
     data = resp.json()
@@ -1956,6 +2037,9 @@ def render_microbiologia():
     confianca_med  = resultado.get("confianca_media", 0.0)
     n_analises     = resultado.get("n_analises", 1)
     diag_cetesb    = resultado.get("diagnostico_cetesb", {})
+    analise_floco  = resultado.get("analise_floco", {})
+    filamentos_info = resultado.get("filamentos", {})
+    alertas_cruzados = resultado.get("alertas_cruzados", [])
 
     # Avisos de qualidade de imagem
     if qualidade == "ruim":
@@ -1972,6 +2056,47 @@ def render_microbiologia():
             del st.session_state["micro_resultado"]
             st.rerun()
         return
+
+    # ── Análise do floco ──
+    analise_floco = resultado.get("analise_floco", {})
+    filamentos_info = resultado.get("filamentos", {})
+    alertas_cruzados = resultado.get("alertas_cruzados", [])
+
+    if analise_floco or filamentos_info:
+        st.subheader("🧫 Análise Morfológica do Lodo")
+        cols_morfo = st.columns(2)
+        with cols_morfo[0]:
+            estrutura = analise_floco.get("estrutura", "—")
+            tam = analise_floco.get("tamanho_estimado_um", "—")
+            obs_floco = analise_floco.get("observacoes", "")
+            cor_floco = {"compacto": "#43A047", "disperso": "#E53935", "irregular": "#FB8C00", "filamentoso": "#E53935"}.get(estrutura, "#546E7A")
+            st.markdown(
+                f"""<div style="background:{cor_floco};border-radius:8px;padding:12px 14px;color:white;margin-bottom:8px;">
+                    <div style="font-size:14px;font-weight:600">🔬 Floco: {estrutura.upper()}</div>
+                    <div style="font-size:12px;margin-top:4px;">Tamanho estimado: ~{tam} µm</div>
+                    <div style="font-size:12px;margin-top:4px;opacity:0.9">{obs_floco}</div>
+                </div>""",
+                unsafe_allow_html=True
+            )
+        with cols_morfo[1]:
+            fil_presente = filamentos_info.get("presentes", False)
+            fil_intens = filamentos_info.get("intensidade", "ausente")
+            fil_morfo = filamentos_info.get("morfologia", "")
+            fil_genero = filamentos_info.get("genero_provavel", "")
+            cor_fil = {"ausente": "#43A047", "leve": "#FB8C00", "moderada": "#E53935", "severa": "#B71C1C"}.get(fil_intens, "#546E7A")
+            st.markdown(
+                f"""<div style="background:{cor_fil};border-radius:8px;padding:12px 14px;color:white;margin-bottom:8px;">
+                    <div style="font-size:14px;font-weight:600">🧵 Filamentos: {fil_intens.upper()}</div>
+                    {f'<div style="font-size:12px;margin-top:4px;">{fil_morfo}</div>' if fil_morfo else ''}
+                    {f'<div style="font-size:12px;margin-top:4px;opacity:0.9">Gênero provável: {fil_genero}</div>' if fil_genero else ''}
+                </div>""",
+                unsafe_allow_html=True
+            )
+
+    if alertas_cruzados:
+        st.subheader("⚡ Alertas Cruzados — Biota × Parâmetros Operacionais")
+        for alerta in alertas_cruzados:
+            st.warning(alerta)
 
     # ── Métricas de confiança e qualidade ──
     st.subheader("📊 Resumo da Análise")
@@ -2016,13 +2141,17 @@ def render_microbiologia():
             cor     = COR_SEMAFORO.get(meta["semaforo"], COR_SEMAFORO["cinza"])
             conf    = org.get("confianca", 0.0)
             votos   = org.get("votos", 1)
+            abund   = org.get("abundancia", "")
+            sig_op  = org.get("significado_operacional", "")
             barra   = "█" * int(conf * 10) + "░" * (10 - int(conf * 10))
+            abund_badge = {"raro": "⚪ Raro", "ocasional": "🟡 Ocasional", "frequente": "🔴 Frequente"}.get(abund, "")
 
             st.markdown(
                 f"""<div style="background:{cor};border-radius:8px;padding:12px 14px;margin-bottom:8px;color:white;">
                     <div style="font-size:15px;font-weight:500">{meta['icon']} {org.get('nome','—')}</div>
-                    <div style="font-size:12px;opacity:0.9;margin-top:2px">{org.get('grupo','')}</div>
+                    <div style="font-size:12px;opacity:0.9;margin-top:2px">{org.get('grupo','')}{f' &nbsp;|&nbsp; {abund_badge}' if abund_badge else ''}</div>
                     <div style="font-size:12px;margin-top:6px">{org.get('descricao','')}</div>
+                    {f'<div style="font-size:12px;margin-top:5px;border-top:1px solid rgba(255,255,255,0.3);padding-top:5px;font-style:italic">💡 {sig_op}</div>' if sig_op else ''}
                     {f'<div style="font-size:11px;margin-top:4px;opacity:0.85">📋 {meta["condicao"]}</div>' if meta.get('condicao') else ''}
                     <div style="font-size:11px;margin-top:6px;opacity:0.8">
                         🎯 Confiança: {barra} {conf*100:.0f}%
@@ -2052,11 +2181,39 @@ def render_microbiologia():
     linhas.append(f"Qualidade do processo: {nivel_icon} {nivel_qual}")
     linhas.append(f"Confiança da análise: {confianca_med*100:.0f}%" if confianca_med else "")
     linhas.append("")
+
+    # Floco
+    if analise_floco:
+        linhas.append(f"🧫 Floco: {analise_floco.get('estrutura','—').upper()} (~{analise_floco.get('tamanho_estimado_um','?')} µm)")
+        if analise_floco.get("observacoes"):
+            linhas.append(f"   {analise_floco['observacoes']}")
+        linhas.append("")
+
+    # Filamentos
+    if filamentos_info and filamentos_info.get("intensidade", "ausente") != "ausente":
+        linhas.append(f"🧵 Filamentos: {filamentos_info.get('intensidade','').upper()}")
+        if filamentos_info.get("genero_provavel"):
+            linhas.append(f"   Gênero provável: {filamentos_info['genero_provavel']}")
+        linhas.append("")
+
     linhas.append("Microrganismos identificados:")
     for org in organismos:
+        abund = org.get('abundancia','')
+        abund_str = f" [{abund}]" if abund else ""
         conf_txt = f" (confiança: {org.get('confianca',0)*100:.0f}%)"
-        linhas.append(f"• {org.get('nome','?')} ({org.get('grupo','')}){conf_txt}: {org.get('descricao','')}")
+        sig = org.get('significado_operacional','')
+        linhas.append(f"• {org.get('nome','?')} ({org.get('grupo','')}){abund_str}{conf_txt}")
+        linhas.append(f"  {org.get('descricao','')}")
+        if sig:
+            linhas.append(f"  → {sig}")
     linhas.append("")
+
+    if alertas_cruzados:
+        linhas.append("⚡ Alertas cruzados (biota × operação):")
+        for alerta in alertas_cruzados:
+            linhas.append(f"• {alerta}")
+        linhas.append("")
+
     linhas.append("Diagnóstico:")
     for d in diag_vermelho + diag_laranja + diag_verde:
         linhas.append(f"{d['icon']} {d['condicao']}")
