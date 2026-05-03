@@ -1335,13 +1335,16 @@ COR_SEMAFORO = {"verde": "#43A047", "laranja": "#FB8C00", "vermelho": "#E53935",
 _secrets = st.secrets if hasattr(st, "secrets") else {}
 GOOGLE_API_KEY_MICRO = _secrets.get("GOOGLE_API_KEY", "")
 
-# Suporte a múltiplas chaves (GOOGLE_API_KEY_1, _2, _3) para rotação e bypass de rate limit
-_raw_keys = [
-    _secrets.get("GOOGLE_API_KEY_1", ""),
-    _secrets.get("GOOGLE_API_KEY_2", ""),
-    _secrets.get("GOOGLE_API_KEY_3", ""),
-]
-GOOGLE_API_KEYS = [k for k in _raw_keys if k] or ([GOOGLE_API_KEY_MICRO] if GOOGLE_API_KEY_MICRO else [])
+# Lê automaticamente GOOGLE_API_KEY_1, _2, _3, ... _N (sem limite fixo)
+_raw_keys = []
+for _i in range(1, 20):  # suporta até 19 chaves
+    _k = _secrets.get(f"GOOGLE_API_KEY_{_i}", "")
+    if _k:
+        _raw_keys.append(_k)
+    else:
+        break  # para no primeiro buraco (ex: tem _1,_2,_4 mas não _3 → para no _3)
+
+GOOGLE_API_KEYS = _raw_keys or ([GOOGLE_API_KEY_MICRO] if GOOGLE_API_KEY_MICRO else [])
 _api_key_cycle = itertools.cycle(GOOGLE_API_KEYS) if GOOGLE_API_KEYS else None
 
 # ──────────────────────────────────────────────────────────────────────────────
