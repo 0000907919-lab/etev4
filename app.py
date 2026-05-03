@@ -1620,7 +1620,7 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
 
     for tentativa in range(MAX_TENTATIVAS):
         chave_atual = next(_api_key_cycle)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={chave_atual}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={chave_atual}"
 
         try:
             resp = requests.post(
@@ -1663,7 +1663,7 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
             time.sleep(espera)
             continue
 
-        if resp.status_code in (400, 401, 403):
+        if resp.status_code in (400, 401, 403, 404):
             # Erros permanentes — não faz sentido retrying com mesma chave
             st.error(f"❌ Erro permanente da API Gemini: {resp.status_code} — {resp.text[:300]}")
             raise requests.exceptions.HTTPError(response=resp)
