@@ -1971,7 +1971,7 @@ def render_microbiologia():
             todas_bytes = [img.read() for img in imagens]
 
             with st.spinner("🔍 Avaliando nitidez e selecionando os melhores frames..."):
-                frames_b64 = _selecionar_melhores_imagens(todas_bytes, max_frames=6)
+                frames_b64 = _selecionar_melhores_imagens(todas_bytes, max_frames=2)
 
             st.caption(f"✅ {len(imagens)} imagem(ns) enviada(s) → {len(frames_b64)} selecionada(s) pelo score de qualidade:")
             cols_prev = st.columns(min(len(frames_b64), 3))
@@ -1982,7 +1982,7 @@ def render_microbiologia():
         video_file = st.file_uploader(
             "Selecione o vídeo (.mp4, .mov, .avi, .webm)",
             type=["mp4", "mov", "avi", "webm", "mkv"],
-            help="O sistema extrai automaticamente os 6 frames mais nítidos e diversificados temporalmente."
+            help="O sistema extrai automaticamente os 2 frames mais nítidos e diversificados temporalmente."
         )
         if video_file is not None:
             st.video(video_file)
@@ -1992,7 +1992,7 @@ def render_microbiologia():
 
             with st.spinner("🎞️ Extraindo e selecionando melhores frames (score de qualidade + diversidade temporal)..."):
                 try:
-                    frames_b64 = _extrair_frames_video(video_bytes, max_frames=6)
+                    frames_b64 = _extrair_frames_video(video_bytes, max_frames=2)
                     if frames_b64:
                         st.success(f"✅ {len(frames_b64)} frame(s) selecionado(s).")
                         cols_prev = st.columns(min(len(frames_b64), 3))
@@ -2025,7 +2025,7 @@ def render_microbiologia():
                         # gemini-1.5-flash gratuito: 15 RPM → mínimo 4s entre chamadas
                         # Com múltiplas chaves, o ciclo distribui automaticamente
                         if idx > 0:
-                            pausa = max(4 // n_chaves, 1)  # ex: 3 chaves → 1s de pausa
+                            pausa = 5  # 5s entre frames — seguro para plano gratuito (30 RPM)
                             time.sleep(pausa)
 
                         pct = int((idx / n_frames) * 100)
