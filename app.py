@@ -1418,17 +1418,23 @@ Exemplos: "OD baixo (X mg/L) favorece filamentos e flagelados — consistente co
 # 1. EXTRAÇÃO DE FRAMES COM FILTRO DE QUALIDADE (Variância do Laplaciano)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _calcular_nitidez_laplaciano(frame_bytes: bytes) -> float:
+def _score_frame_microscopia(frame_bytes: bytes) -> float:
     """
-    Calcula a nitidez de um frame usando variância do Laplaciano.
-    Quanto maior o valor, mais nítida a imagem.
-    Retorna 0.0 se não conseguir calcular (ex: PIL não disponível).
+    Score de qualidade específico para microscópio de lodo ativado.
+    Combina três métricas:
+      1. Variância do Laplaciano (nitidez de bordas)
+      2. Penalidade por frames muito brancos (fundo sem organismos) ou muito escuros
+      3. Desvio padrão dos pixels (contraste — frames com organismos têm distribuição ampla)
+
+    Retorna 0.0 se PIL não disponível.
     """
     try:
-        from PIL import Image, ImageFilter
+        from PIL import Image, ImageFilter, ImageStat
         import io as _io
-        img = Image.open(_io.BytesIO(frame_bytes)).convert("L")  # escala de cinza
-        # Aplica filtro Laplaciano para detectar bordas
+
+        img = Image.open(_io.BytesIO(frame_bytes)).convert("L")
+
+        # 1. Nitidez pelo Laplaciano
         lap = img.filter(ImageFilter.Kernel(
             size=3,
             kernel=[-1, -1, -1,
@@ -1436,32 +1442,45 @@ def _calcular_nitidez_laplaciano(frame_bytes: bytes) -> float:
                     -1, -1, -1],
             scale=1, offset=0
         ))
-        arr = np.array(lap, dtype=np.float32)
-        return float(np.var(arr))  # variância = medida de nitidez
+        arr_lap = np.array(lap, dtype=np.float32)
+        nitidez = float(np.var(arr_lap))
+
+        # 2. Brilho médio — penalidade para frames brancos (fundo limpo) ou pretos
+        stat = ImageStat.Stat(img)
+        brilho = stat.mean[0]   # 0=preto … 255=branco
+        if brilho > 230 or brilho < 30:
+            fator_brilho = 0.05   # quase descartado — frame inútil
+        elif brilho > 210 or brilho < 60:
+            fator_brilho = 0.40
+        else:
+            fator_brilho = 1.0    # faixa ideal para campo claro: 60-210
+
+        # 3. Contraste (desvio padrão) — frames com organismos têm alto desvio
+        std_px = stat.stddev[0]
+        contraste = min(std_px / 80.0, 1.0)
+
+        # Score composto (nitidez 60% + contraste 40%) × penalidade de brilho
+        return (nitidez * 0.6 + contraste * 100.0 * 0.4) * fator_brilho
+
     except Exception:
         return 0.0
 
 
-def _extrair_frames_video(video_bytes: bytes, max_frames: int = 8) -> list:
+def _extrair_frames_video(video_bytes: bytes, max_frames: int = 6) -> list:
     """
-    Extrai entre 1 e `max_frames` frames do vídeo usando ffmpeg.
-    Aplica filtro de qualidade (Laplaciano) para selecionar apenas frames nítidos.
-
-    Args:
-        video_bytes: Bytes do arquivo de vídeo
-        max_frames: Número máximo de frames a retornar (padrão: 2)
+    Extrai até `max_frames` frames do vídeo com ffmpeg.
+    Estratégia dupla: amostragem densa + filtro de score + diversidade temporal.
 
     Returns:
-        Lista de strings base64 dos melhores frames
+        Lista de strings base64 dos melhores frames ordenados por timestamp.
     """
-    frames_candidatos = []  # lista de (nitidez, b64)
+    frames_candidatos = []  # (score, timestamp, b64)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         video_path = os.path.join(tmpdir, "video.mp4")
         with open(video_path, "wb") as f:
             f.write(video_bytes)
 
-        # Obtém duração do vídeo
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", video_path],
@@ -1472,71 +1491,74 @@ def _extrair_frames_video(video_bytes: bytes, max_frames: int = 8) -> list:
         except Exception:
             duration = 10.0
 
-        # Extrai mais candidatos do que o necessário para poder filtrar
-        n_candidatos = max(max_frames * 3, 6)  # extrai 3x mais para selecionar os melhores
+        # Amostra densa: 4× mais candidatos que o necessário, evitando primeiros/últimos 5%
+        n_candidatos = max(max_frames * 4, 24)
+        t_start = duration * 0.05
+        t_end   = duration * 0.95
+        passo   = (t_end - t_start) / max(n_candidatos - 1, 1)
 
         for i in range(n_candidatos):
-            # Distribui timestamps ao longo do vídeo, evitando início e fim (mais borrados)
-            t = duration * 0.1 + (duration * 0.8) / (n_candidatos + 1) * (i + 1)
-            frame_path = os.path.join(tmpdir, f"frame_{i:02d}.jpg")
-
+            t = t_start + passo * i
+            frame_path = os.path.join(tmpdir, f"frame_{i:03d}.jpg")
             subprocess.run(
                 ["ffmpeg", "-ss", str(t), "-i", video_path,
-                 "-vframes", "1", "-vf", "scale=512:-1", "-q:v", "3",
+                 "-vframes", "1",
+                 "-vf", "scale='min(640,iw)':-1",  # máx 640px, preserva proporção
+                 "-q:v", "2",                        # JPEG alta qualidade
                  frame_path, "-y"],
                 capture_output=True
             )
-
             if os.path.exists(frame_path):
                 with open(frame_path, "rb") as fimg:
-                    frame_bytes_local = fimg.read()
-                nitidez = _calcular_nitidez_laplaciano(frame_bytes_local)
-                b64 = base64.b64encode(frame_bytes_local).decode()
-                frames_candidatos.append((nitidez, b64))
+                    fb = fimg.read()
+                score = _score_frame_microscopia(fb)
+                frames_candidatos.append((score, t, base64.b64encode(fb).decode()))
 
     if not frames_candidatos:
         return []
 
-    # Ordena por nitidez (maior = mais nítido) e seleciona os melhores
     frames_candidatos.sort(key=lambda x: x[0], reverse=True)
-    melhores = frames_candidatos[:max_frames]
 
-    # Log de nitidez para debug
-    nitidez_scores = [round(n, 1) for n, _ in frames_candidatos]
-    print(f"[Microbiologia] Nitidez dos candidatos: {nitidez_scores}")
-    print(f"[Microbiologia] Selecionados: {[round(n, 1) for n, _ in melhores]}")
+    # Seleciona os melhores com diversidade temporal mínima (≥5% da duração entre frames)
+    dist_min = duration * 0.05
+    selecionados = []
+    for score, t, b64 in frames_candidatos:
+        if not any(abs(t - ts) < dist_min for _, ts, _ in selecionados):
+            selecionados.append((score, t, b64))
+        if len(selecionados) >= max_frames:
+            break
 
-    return [b64 for _, b64 in melhores]
+    # Completa se diversidade eliminou candidatos demais
+    if len(selecionados) < max_frames:
+        usados = {b for _, _, b in selecionados}
+        for score, t, b64 in frames_candidatos:
+            if b64 not in usados:
+                selecionados.append((score, t, b64))
+            if len(selecionados) >= max_frames:
+                break
+
+    print(f"[Frames] {len(frames_candidatos)} candidatos → {len(selecionados)} selecionados")
+    print(f"[Frames] Scores: {[round(s,1) for s,_,_ in selecionados]}")
+    print(f"[Frames] Timestamps: {[round(t,2) for _,t,_ in selecionados]}")
+
+    # Retorna ordenado por timestamp (ordem cronológica para a IA)
+    selecionados.sort(key=lambda x: x[1])
+    return [b64 for _, _, b64 in selecionados]
 
 
-def _selecionar_melhores_imagens(imagens_bytes: list, max_frames: int = 8) -> list:
+def _selecionar_melhores_imagens(imagens_bytes: list, max_frames: int = 6) -> list:
     """
-    Para imagens estáticas (JPG/PNG), aplica filtro de nitidez e retorna as melhores.
-
-    Args:
-        imagens_bytes: Lista de bytes das imagens
-        max_frames: Número máximo de imagens a retornar
-
-    Returns:
-        Lista de strings base64 das imagens mais nítidas
+    Para imagens estáticas: aplica _score_frame_microscopia e retorna as melhores.
     """
     if not imagens_bytes:
         return []
-
-    # Se há poucas imagens, usa todas
     if len(imagens_bytes) <= max_frames:
         return [base64.b64encode(b).decode() for b in imagens_bytes]
 
-    # Calcula nitidez de cada imagem
-    scored = []
-    for img_bytes in imagens_bytes:
-        nitidez = _calcular_nitidez_laplaciano(img_bytes)
-        scored.append((nitidez, img_bytes))
-
-    # Seleciona as mais nítidas
+    scored = [(_score_frame_microscopia(b), b) for b in imagens_bytes]
     scored.sort(key=lambda x: x[0], reverse=True)
-    melhores = scored[:max_frames]
-    return [base64.b64encode(b).decode() for _, b in melhores]
+    print(f"[Imagens] {len(scored)} candidatas → top {max_frames}, scores: {[round(s,1) for s,_ in scored[:max_frames]]}")
+    return [base64.b64encode(b).decode() for _, b in scored[:max_frames]]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1598,7 +1620,7 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
 
     for tentativa in range(MAX_TENTATIVAS):
         chave_atual = next(_api_key_cycle)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={chave_atual}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={chave_atual}"
 
         try:
             resp = requests.post(
@@ -1943,25 +1965,24 @@ def render_microbiologia():
             "Selecione uma ou mais fotos do microscópio",
             type=["jpg", "jpeg", "png", "bmp", "tiff"],
             accept_multiple_files=True,
-            help="Envie fotos tiradas pelo microscópio. O sistema seleciona automaticamente as mais nítidas (até 2)."
+            help="Envie fotos tiradas pelo microscópio. O sistema seleciona automaticamente as mais nítidas (até 6)."
         )
         if imagens:
             todas_bytes = [img.read() for img in imagens]
 
-            # Aplica filtro de qualidade — seleciona até 8 melhores
-            with st.spinner("🔍 Selecionando frames mais nítidos..."):
-                frames_b64 = _selecionar_melhores_imagens(todas_bytes, max_frames=2)
+            with st.spinner("🔍 Avaliando nitidez e selecionando os melhores frames..."):
+                frames_b64 = _selecionar_melhores_imagens(todas_bytes, max_frames=6)
 
-            st.caption(f"✅ {len(imagens)} imagem(ns) enviada(s) → {len(frames_b64)} selecionada(s) pela nitidez:")
-            cols_prev = st.columns(min(len(frames_b64), 2))
+            st.caption(f"✅ {len(imagens)} imagem(ns) enviada(s) → {len(frames_b64)} selecionada(s) pelo score de qualidade:")
+            cols_prev = st.columns(min(len(frames_b64), 3))
             for i, b64 in enumerate(frames_b64):
-                cols_prev[i % 2].image(base64.b64decode(b64), caption=f"Frame selecionado {i+1}", use_container_width=True)
+                cols_prev[i % 3].image(base64.b64decode(b64), caption=f"Frame {i+1}", use_container_width=True)
 
     else:
         video_file = st.file_uploader(
             "Selecione o vídeo (.mp4, .mov, .avi, .webm)",
             type=["mp4", "mov", "avi", "webm", "mkv"],
-            help="O sistema extrai automaticamente os frames mais nítidos (até 2)."
+            help="O sistema extrai automaticamente os 6 frames mais nítidos e diversificados temporalmente."
         )
         if video_file is not None:
             st.video(video_file)
@@ -1969,14 +1990,14 @@ def render_microbiologia():
             video_bytes = video_file.read()
             st.caption(f"Tamanho: {len(video_bytes) / (1024*1024):.1f} MB")
 
-            with st.spinner("🎞️ Extraindo e filtrando frames por nitidez (Laplaciano)..."):
+            with st.spinner("🎞️ Extraindo e selecionando melhores frames (score de qualidade + diversidade temporal)..."):
                 try:
-                    frames_b64 = _extrair_frames_video(video_bytes, max_frames=2)
+                    frames_b64 = _extrair_frames_video(video_bytes, max_frames=6)
                     if frames_b64:
-                        st.success(f"✅ {len(frames_b64)} frame(s) nítido(s) selecionado(s).")
-                        cols_prev = st.columns(min(len(frames_b64), 2))
+                        st.success(f"✅ {len(frames_b64)} frame(s) selecionado(s).")
+                        cols_prev = st.columns(min(len(frames_b64), 3))
                         for i, b64 in enumerate(frames_b64):
-                            cols_prev[i % 2].image(base64.b64decode(b64), caption=f"Frame nítido {i+1}", use_container_width=True)
+                            cols_prev[i % 3].image(base64.b64decode(b64), caption=f"Frame {i+1}", use_container_width=True)
                     else:
                         st.error("❌ Não foi possível extrair frames. Use o modo Fotos acima.")
                 except Exception as e:
@@ -1991,28 +2012,64 @@ def render_microbiologia():
                 st.error("❌ Nenhuma chave API Google configurada. Adicione GOOGLE_API_KEY (ou GOOGLE_API_KEY_1/2/3) nos Secrets do Streamlit.")
                 st.stop()
 
-            with st.status("Analisando frames selecionados...", expanded=True) as status_micro:
-                try:
-                    n_chaves = len(GOOGLE_API_KEYS)
-                    st.write(f"🤖 Enviando {len(frames_b64)} frame(s) numa única requisição (economiza cota) — {n_chaves} chave(s) disponível(is)...")
+            n_chaves = len(GOOGLE_API_KEYS)
+            n_frames = len(frames_b64)
 
-                    # Envia TODOS os frames juntos numa única chamada à API
-                    # Evita múltiplas requisições — importante com limite de 5 RPM
-                    resultado_unico = _chamar_gemini_micro(
-                        frames_b64, params_filtrados
-                    )
-                    resultados_por_frame = [resultado_unico] if not resultado_unico.get("_erro_parse") else []
+            with st.status(f"Analisando {n_frames} frame(s) — 1 por requisição para respeitar cota gratuita...", expanded=True) as status_micro:
+                try:
+                    resultados_por_frame = []
+                    progress = st.progress(0, text="Iniciando análise...")
+
+                    for idx, b64 in enumerate(frames_b64):
+                        # Pausa entre requisições para respeitar RPM do plano gratuito
+                        # gemini-1.5-flash gratuito: 15 RPM → mínimo 4s entre chamadas
+                        # Com múltiplas chaves, o ciclo distribui automaticamente
+                        if idx > 0:
+                            pausa = max(4 // n_chaves, 1)  # ex: 3 chaves → 1s de pausa
+                            time.sleep(pausa)
+
+                        pct = int((idx / n_frames) * 100)
+                        progress.progress(pct, text=f"🔬 Analisando frame {idx+1}/{n_frames}...")
+                        st.write(f"• Frame {idx+1}/{n_frames} — enviando para Gemini ({n_chaves} chave(s))...")
+
+                        resultado_frame = _chamar_gemini_micro([b64], params_filtrados)
+                        if not resultado_frame.get("_erro_parse"):
+                            resultados_por_frame.append(resultado_frame)
+                            n_org = len(resultado_frame.get("organismos", []))
+                            st.write(f"  ✅ Frame {idx+1}: {n_org} organismo(s) identificado(s)")
+                        else:
+                            st.write(f"  ⚠️ Frame {idx+1}: erro de parse — descartado da agregação")
+
+                    progress.progress(100, text="Agregando resultados...")
+
+                    if not resultados_por_frame:
+                        st.error("❌ Nenhum frame foi analisado com sucesso.")
+                        st.stop()
+
+                    # Agrega resultados de todos os frames por voto majoritário
+                    st.write(f"📊 Agregando {len(resultados_por_frame)} resultado(s) por voto majoritário...")
                     resultado_consolidado = _agregar_resultados(resultados_por_frame)
+
+                    # Propaga analise_floco e filamentos do frame com melhor qualidade_imagem
+                    for r in sorted(resultados_por_frame,
+                                    key=lambda x: {"boa": 2, "regular": 1, "ruim": 0}.get(x.get("qualidade_imagem",""), 1),
+                                    reverse=True):
+                        if r.get("analise_floco"):
+                            resultado_consolidado.setdefault("analise_floco", r["analise_floco"])
+                        if r.get("filamentos"):
+                            resultado_consolidado.setdefault("filamentos", r["filamentos"])
+                        if r.get("alertas_cruzados"):
+                            resultado_consolidado.setdefault("alertas_cruzados", r["alertas_cruzados"])
+                        if resultado_consolidado.get("analise_floco") and resultado_consolidado.get("alertas_cruzados"):
+                            break
 
                     # Aplica regras CETESB
                     st.write("📋 Aplicando regras CETESB L1.025...")
                     diagnostico_cetesb = aplicar_regras_cetesb(resultado_consolidado.get("organismos", []))
-
-                    # Armazena resultado completo
                     resultado_consolidado["diagnostico_cetesb"] = diagnostico_cetesb
                     st.session_state["micro_resultado"] = resultado_consolidado
 
-                    status_micro.update(label="✅ Análise concluída!", state="complete")
+                    status_micro.update(label=f"✅ Análise concluída! {len(resultados_por_frame)}/{n_frames} frame(s) processado(s).", state="complete")
 
                 except requests.exceptions.HTTPError as e:
                     st.error(f"❌ Erro na API: {e.response.status_code} — {e.response.text[:300]}")
