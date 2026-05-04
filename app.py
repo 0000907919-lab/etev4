@@ -1335,16 +1335,13 @@ COR_SEMAFORO = {"verde": "#43A047", "laranja": "#FB8C00", "vermelho": "#E53935",
 _secrets = st.secrets if hasattr(st, "secrets") else {}
 GOOGLE_API_KEY_MICRO = _secrets.get("GOOGLE_API_KEY", "")
 
-# Lê automaticamente GOOGLE_API_KEY_1, _2, _3, ... _N (sem limite fixo)
-_raw_keys = []
-for _i in range(1, 20):  # suporta até 19 chaves
-    _k = _secrets.get(f"GOOGLE_API_KEY_{_i}", "")
-    if _k:
-        _raw_keys.append(_k)
-    else:
-        break  # para no primeiro buraco (ex: tem _1,_2,_4 mas não _3 → para no _3)
-
-GOOGLE_API_KEYS = _raw_keys or ([GOOGLE_API_KEY_MICRO] if GOOGLE_API_KEY_MICRO else [])
+# Suporte a múltiplas chaves (GOOGLE_API_KEY_1, _2, _3) para rotação e bypass de rate limit
+_raw_keys = [
+    _secrets.get("GOOGLE_API_KEY_1", ""),
+    _secrets.get("GOOGLE_API_KEY_2", ""),
+    _secrets.get("GOOGLE_API_KEY_3", ""),
+]
+GOOGLE_API_KEYS = [k for k in _raw_keys if k] or ([GOOGLE_API_KEY_MICRO] if GOOGLE_API_KEY_MICRO else [])
 _api_key_cycle = itertools.cycle(GOOGLE_API_KEYS) if GOOGLE_API_KEYS else None
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1615,14 +1612,11 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
         raise ValueError("Nenhuma chave GOOGLE_API_KEY configurada nos Secrets.")
 
     n_chaves = len(GOOGLE_API_KEYS)
-    # Backoff exponencial com base maior para respeitar RPM do plano gratuito Gemini
-    # Plano Free: ~15 RPM por chave → precisamos de pelo menos 4s entre chamadas da mesma chave
-    # Backoff: 15s, 30s, 60s, 60s, 60s — conservador para não estourar cota
-    BACKOFF_BASE = 15  # espera mínima em 429/503 — respeita o RPM gratuito
-    MAX_TENTATIVAS = max(n_chaves * 4, 8)  # mais tentativas para dar tempo ao backoff
+    # Backoff: 2s, 4s, 8s, 16s, 32s — cresce com o número de tentativas, não com o índice de chave
+    BACKOFF_BASE = 2
+    MAX_TENTATIVAS = max(n_chaves * 3, 6)
     ultimo_status = None
     ultimo_erro = None
-    _429_consecutivos = 0  # contador de 429 seguidos para detectar esgotamento de cota
 
     for tentativa in range(MAX_TENTATIVAS):
         chave_atual = next(_api_key_cycle)
@@ -1636,13 +1630,13 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
                 timeout=90
             )
         except requests.exceptions.Timeout:
-            espera = min(BACKOFF_BASE * (tentativa + 1), 60)
+            espera = BACKOFF_BASE ** min(tentativa, 4)
             st.warning(f"⏳ Timeout (tentativa {tentativa+1}/{MAX_TENTATIVAS}). Nova chave em {espera}s...")
             time.sleep(espera)
             ultimo_erro = "Timeout"
             continue
         except requests.exceptions.RequestException as e:
-            espera = min(BACKOFF_BASE * (tentativa + 1), 60)
+            espera = BACKOFF_BASE ** min(tentativa, 4)
             st.warning(f"⏳ Erro de rede: {e} — tentativa {tentativa+1}/{MAX_TENTATIVAS}. Aguardando {espera}s...")
             time.sleep(espera)
             ultimo_erro = str(e)
@@ -1651,27 +1645,20 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
         ultimo_status = resp.status_code
 
         if resp.status_code == 200:
-            _429_consecutivos = 0
             break  # sucesso — sai do loop
 
         if resp.status_code in (429, 503, 529):
-            _429_consecutivos += 1
             motivo = {429: "rate limit (429)", 503: "sobrecarga (503)", 529: "overloaded (529)"}.get(resp.status_code, str(resp.status_code))
-            # Prioriza Retry-After da API se disponível — respeita o que o servidor pede
-            retry_after = resp.headers.get("Retry-After") or resp.headers.get("x-ratelimit-reset-requests")
+            # Verifica se a API informou um Retry-After
+            retry_after = resp.headers.get("Retry-After")
             if retry_after:
                 try:
                     espera = int(retry_after)
                 except ValueError:
-                    espera = min(BACKOFF_BASE * (tentativa + 1), 120)
+                    espera = BACKOFF_BASE ** min(tentativa, 4)
             else:
-                # Backoff linear conservador: 15s, 30s, 45s... máx 120s
-                # Se todas as chaves já retornaram 429, espera mais
-                if _429_consecutivos >= n_chaves:
-                    espera = min(BACKOFF_BASE * _429_consecutivos, 120)
-                    st.warning(f"⚠️ Todas as {n_chaves} chave(s) com rate limit. Aguardando {espera}s para cota resetar...")
-                else:
-                    espera = min(BACKOFF_BASE * (tentativa + 1), 120)
+                espera = BACKOFF_BASE ** min(tentativa, 4)
+            espera = min(espera, 60)  # nunca esperar mais de 60s
             st.warning(f"⏳ Gemini {motivo} — chave rotacionada. Aguardando {espera}s... (tentativa {tentativa+1}/{MAX_TENTATIVAS})")
             time.sleep(espera)
             continue
@@ -1984,7 +1971,7 @@ def render_microbiologia():
             todas_bytes = [img.read() for img in imagens]
 
             with st.spinner("🔍 Avaliando nitidez e selecionando os melhores frames..."):
-                frames_b64 = _selecionar_melhores_imagens(todas_bytes, max_frames=2)
+                frames_b64 = _selecionar_melhores_imagens(todas_bytes, max_frames=6)
 
             st.caption(f"✅ {len(imagens)} imagem(ns) enviada(s) → {len(frames_b64)} selecionada(s) pelo score de qualidade:")
             cols_prev = st.columns(min(len(frames_b64), 3))
@@ -1995,7 +1982,7 @@ def render_microbiologia():
         video_file = st.file_uploader(
             "Selecione o vídeo (.mp4, .mov, .avi, .webm)",
             type=["mp4", "mov", "avi", "webm", "mkv"],
-            help="O sistema extrai automaticamente os 2 frames mais nítidos e diversificados temporalmente."
+            help="O sistema extrai automaticamente os 6 frames mais nítidos e diversificados temporalmente."
         )
         if video_file is not None:
             st.video(video_file)
@@ -2005,7 +1992,7 @@ def render_microbiologia():
 
             with st.spinner("🎞️ Extraindo e selecionando melhores frames (score de qualidade + diversidade temporal)..."):
                 try:
-                    frames_b64 = _extrair_frames_video(video_bytes, max_frames=2)
+                    frames_b64 = _extrair_frames_video(video_bytes, max_frames=6)
                     if frames_b64:
                         st.success(f"✅ {len(frames_b64)} frame(s) selecionado(s).")
                         cols_prev = st.columns(min(len(frames_b64), 3))
@@ -2035,10 +2022,10 @@ def render_microbiologia():
 
                     for idx, b64 in enumerate(frames_b64):
                         # Pausa entre requisições para respeitar RPM do plano gratuito
-                        # gemini-2.0-flash-lite gratuito: ~15 RPM (1 req a cada 4s)
-                        # 6s garante margem; com N chaves o ciclo distribui automaticamente
+                        # gemini-1.5-flash gratuito: 15 RPM → mínimo 4s entre chamadas
+                        # Com múltiplas chaves, o ciclo distribui automaticamente
                         if idx > 0:
-                            pausa = max(6, int(60 / max(n_chaves * 10, 1)))  # minimo 6s
+                            pausa = max(4 // n_chaves, 1)  # ex: 3 chaves → 1s de pausa
                             time.sleep(pausa)
 
                         pct = int((idx / n_frames) * 100)
@@ -2307,6 +2294,8 @@ def render_microbiologia():
     if st.button("🗑️ Limpar e analisar novamente"):
         del st.session_state["micro_resultado"]
         st.rerun()
+
+
 render_microbiologia()
 
 f = df.drop_duplicates()
