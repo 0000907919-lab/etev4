@@ -1615,15 +1615,14 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
         raise ValueError("Nenhuma chave GOOGLE_API_KEY configurada nos Secrets.")
 
     n_chaves = len(GOOGLE_API_KEYS)
-    # gemini-2.0-flash-lite gratuito: 30 RPM por chave → mínimo 2s entre calls na mesma chave
-    # Com rotação, o intervalo efetivo por chave = n_chaves × pausa_entre_tentativas
-    # Backoff mínimo: 4s (seguro para 15 RPM também); máximo: 120s
-    BACKOFF_MIN  = 4
-    BACKOFF_BASE = 2
-    BACKOFF_MAX  = 120
-    MAX_TENTATIVAS = max(n_chaves * 3, 9)
+    # Backoff exponencial com base maior para respeitar RPM do plano gratuito Gemini
+    # Plano Free: ~15 RPM por chave → precisamos de pelo menos 4s entre chamadas da mesma chave
+    # Backoff: 15s, 30s, 60s, 60s, 60s — conservador para não estourar cota
+    BACKOFF_BASE = 15  # espera mínima em 429/503 — respeita o RPM gratuito
+    MAX_TENTATIVAS = max(n_chaves * 4, 8)  # mais tentativas para dar tempo ao backoff
     ultimo_status = None
     ultimo_erro = None
+    _429_consecutivos = 0  # contador de 429 seguidos para detectar esgotamento de cota
 
     for tentativa in range(MAX_TENTATIVAS):
         chave_atual = next(_api_key_cycle)
@@ -1637,13 +1636,13 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
                 timeout=90
             )
         except requests.exceptions.Timeout:
-            espera = max(BACKOFF_MIN, BACKOFF_BASE ** min(tentativa, 5))
+            espera = min(BACKOFF_BASE * (tentativa + 1), 60)
             st.warning(f"⏳ Timeout (tentativa {tentativa+1}/{MAX_TENTATIVAS}). Nova chave em {espera}s...")
             time.sleep(espera)
             ultimo_erro = "Timeout"
             continue
         except requests.exceptions.RequestException as e:
-            espera = max(BACKOFF_MIN, BACKOFF_BASE ** min(tentativa, 5))
+            espera = min(BACKOFF_BASE * (tentativa + 1), 60)
             st.warning(f"⏳ Erro de rede: {e} — tentativa {tentativa+1}/{MAX_TENTATIVAS}. Aguardando {espera}s...")
             time.sleep(espera)
             ultimo_erro = str(e)
@@ -1652,35 +1651,43 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
         ultimo_status = resp.status_code
 
         if resp.status_code == 200:
+            _429_consecutivos = 0
             break  # sucesso — sai do loop
 
         if resp.status_code in (429, 503, 529):
+            _429_consecutivos += 1
             motivo = {429: "rate limit (429)", 503: "sobrecarga (503)", 529: "overloaded (529)"}.get(resp.status_code, str(resp.status_code))
-            # Usa Retry-After se disponível, senão backoff exponencial com mínimo garantido
-            retry_after = resp.headers.get("Retry-After")
+            # Prioriza Retry-After da API se disponível — respeita o que o servidor pede
+            retry_after = resp.headers.get("Retry-After") or resp.headers.get("x-ratelimit-reset-requests")
             if retry_after:
                 try:
-                    espera = max(BACKOFF_MIN, int(retry_after))
+                    espera = int(retry_after)
                 except ValueError:
-                    espera = max(BACKOFF_MIN, BACKOFF_BASE ** min(tentativa, 5))
+                    espera = min(BACKOFF_BASE * (tentativa + 1), 120)
             else:
-                espera = max(BACKOFF_MIN, BACKOFF_BASE ** min(tentativa, 5))
-            espera = min(espera, BACKOFF_MAX)
+                # Backoff linear conservador: 15s, 30s, 45s... máx 120s
+                # Se todas as chaves já retornaram 429, espera mais
+                if _429_consecutivos >= n_chaves:
+                    espera = min(BACKOFF_BASE * _429_consecutivos, 120)
+                    st.warning(f"⚠️ Todas as {n_chaves} chave(s) com rate limit. Aguardando {espera}s para cota resetar...")
+                else:
+                    espera = min(BACKOFF_BASE * (tentativa + 1), 120)
             st.warning(f"⏳ Gemini {motivo} — chave rotacionada. Aguardando {espera}s... (tentativa {tentativa+1}/{MAX_TENTATIVAS})")
             time.sleep(espera)
             continue
 
         if resp.status_code in (400, 401, 403, 404):
+            # Erros permanentes — não faz sentido retrying com mesma chave
             st.error(f"❌ Erro permanente da API Gemini: {resp.status_code} — {resp.text[:300]}")
             raise requests.exceptions.HTTPError(response=resp)
 
-        # Outros erros 5xx
-        espera = max(BACKOFF_MIN, BACKOFF_BASE ** min(tentativa, 5))
-        espera = min(espera, BACKOFF_MAX)
+        # Outros erros 5xx — tenta novamente
+        espera = BACKOFF_BASE ** min(tentativa, 4)
         st.warning(f"⏳ Erro {resp.status_code} da API — tentativa {tentativa+1}/{MAX_TENTATIVAS}. Aguardando {espera}s...")
         time.sleep(espera)
 
     else:
+        # Todas as tentativas falharam
         msg = f"Todas as {MAX_TENTATIVAS} tentativas falharam."
         if ultimo_status:
             msg += f" Último status HTTP: {ultimo_status}."
@@ -1688,6 +1695,7 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
             msg += f" Último erro: {ultimo_erro}."
         raise RuntimeError(msg)
 
+    # Se chegou aqui sem 200, ultima tentativa também falhou
     if ultimo_status and ultimo_status != 200:
         resp.raise_for_status()
 
@@ -2027,10 +2035,10 @@ def render_microbiologia():
 
                     for idx, b64 in enumerate(frames_b64):
                         # Pausa entre requisições para respeitar RPM do plano gratuito
-                        # gemini-1.5-flash gratuito: 15 RPM → mínimo 4s entre chamadas
-                        # Com múltiplas chaves, o ciclo distribui automaticamente
+                        # gemini-2.0-flash-lite gratuito: ~15 RPM (1 req a cada 4s)
+                        # 6s garante margem; com N chaves o ciclo distribui automaticamente
                         if idx > 0:
-                            pausa = 10  # 10s entre frames — garante folga de RPM mesmo com chaves recém-usadas
+                            pausa = max(6, int(60 / max(n_chaves * 10, 1)))  # minimo 6s
                             time.sleep(pausa)
 
                         pct = int((idx / n_frames) * 100)
