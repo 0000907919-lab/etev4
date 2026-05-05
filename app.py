@@ -1335,85 +1335,46 @@ COR_SEMAFORO = {"verde": "#43A047", "laranja": "#FB8C00", "vermelho": "#E53935",
 _secrets = st.secrets if hasattr(st, "secrets") else {}
 GOOGLE_API_KEY_MICRO = _secrets.get("GOOGLE_API_KEY", "")
 
-# Lê automaticamente GOOGLE_API_KEY_1, _2, _3, ... _N (sem limite fixo)
-_raw_keys = []
-for _i in range(1, 20):  # suporta até 19 chaves
-    _k = _secrets.get(f"GOOGLE_API_KEY_{_i}", "")
-    if _k:
-        _raw_keys.append(_k)
-    else:
-        break  # para no primeiro buraco (ex: tem _1,_2,_4 mas não _3 → para no _3)
-
-GOOGLE_API_KEYS = _raw_keys or ([GOOGLE_API_KEY_MICRO] if GOOGLE_API_KEY_MICRO else [])
+# Suporte a múltiplas chaves (GOOGLE_API_KEY_1, _2, _3) para rotação e bypass de rate limit
+_raw_keys = [
+    _secrets.get("GOOGLE_API_KEY_1", ""),
+    _secrets.get("GOOGLE_API_KEY_2", ""),
+    _secrets.get("GOOGLE_API_KEY_3", ""),
+]
+GOOGLE_API_KEYS = [k for k in _raw_keys if k] or ([GOOGLE_API_KEY_MICRO] if GOOGLE_API_KEY_MICRO else [])
 _api_key_cycle = itertools.cycle(GOOGLE_API_KEYS) if GOOGLE_API_KEYS else None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROMPT ESTRUTURADO — Versão melhorada com instrução de JSON estrito
 # ──────────────────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT_MICRO = """Você é um microbiologista sênior especializado em sistemas de lodos ativados, com profundo conhecimento da Norma Técnica CETESB L1.025 e da literatura internacional de biologia de lodos (Wanner, Jenkins, Gerardi).
+SYSTEM_PROMPT_MICRO = """Você é um especialista em microbiologia de sistemas de lodos ativados, seguindo a Norma Técnica CETESB L1.025.
+Analise as imagens de microscópio fornecidas e identifique microrganismos visíveis.
 
-Sua missão: analisar imagens de microscópio de lodo ativado e gerar um laudo microbiológico completo, técnico e acionável — equivalente ao que um operador experiente receberia de um laboratório de referência.
-
-═══ CHAVES PERMITIDAS (use EXATAMENTE uma dessas por organismo) ═══
+Para cada organismo ou grupo identificado, classifique usando EXATAMENTE uma dessas chaves:
 flagelados, flagelados_rizopodes, ciliados_pedunculados, ciliados_livres, arcella, aspidisca,
 trachelophyllum, vorticella_microstoma, aelosoma, rotiferos, filamentos, nematoides,
 rizopodes_amebas, flocos_bons, flocos_dispersos, cianobacterias, protozoa_livre
 
-═══ INSTRUÇÕES DE ANÁLISE ═══
+REGRAS IMPORTANTES:
+1. Responda APENAS com JSON válido, sem texto antes ou depois, sem markdown, sem blocos de código
+2. Não use aspas dentro de strings — use apenas aspas duplas no JSON
+3. Se a imagem for de baixa qualidade, indique nos campos e liste o que conseguiu observar
+4. Estime uma confiança (0.0 a 1.0) para cada organismo identificado
 
-Para CADA organismo identificado:
-- Descreva morfologia específica (tamanho estimado em µm, formato, mobilidade, coloração aparente)
-- Indique abundância relativa: raro (<5 por campo), ocasional (5-20), frequente (>20 por campo)
-- Relacione com o parâmetro operacional mais relevante (OD, IVL, θc, carga orgânica)
-- Aponte o que a PRESENÇA desse organismo significa NESTE momento operacional
-
-Para a análise do FLOCO:
-- Estrutura (compacto/disperso/irregular/filamentoso)
-- Tamanho médio estimado (µm)
-- Presença de material inerte, coloração escura, lodo intumescido
-- Relação floco/fundo (clareza do líquido entre flocos)
-
-Para a análise de FILAMENTOS (se houver):
-- Morfologia (retos, curvos, com ramificações, com bainhas)
-- Posição (protruindo do floco ou internos)
-- Estimativa de intensidade: leve/moderada/severa (potencial de bulking)
-- Possível gênero (Microthrix, Nocardia, Thiothrix, tipo 021N, etc.)
-
-Nos "alertas_cruzados": correlacione o que viu com os parâmetros operacionais informados.
-Exemplos: "OD baixo (X mg/L) favorece filamentos e flagelados — consistente com achado";
-"θc estimada pelo biota sugere lodo jovem — verificar relação A/M".
-
-═══ FORMATO OBRIGATÓRIO (JSON puro, sem markdown, sem texto extra) ═══
+Formato OBRIGATÓRIO da resposta (JSON puro):
 {
   "organismos": [
     {
       "chave": "chave_da_tabela",
-      "nome": "nome científico ou grupo (ex: Vorticella convallaria, Arcella sp.)",
-      "grupo": "grupo taxonômico (ex: Protozoário ciliado séssil)",
-      "descricao": "descrição morfológica detalhada observada na imagem",
-      "abundancia": "raro|ocasional|frequente",
-      "significado_operacional": "o que a presença deste organismo indica sobre o processo",
+      "nome": "nome cientifico ou grupo",
+      "grupo": "grupo taxonomico",
+      "descricao": "o que foi observado na imagem",
       "confianca": 0.85
     }
   ],
-  "analise_floco": {
-    "estrutura": "compacto|disperso|irregular|filamentoso",
-    "tamanho_estimado_um": 300,
-    "observacoes": "descrição detalhada do floco e da fase líquida"
-  },
-  "filamentos": {
-    "presentes": true,
-    "intensidade": "leve|moderada|severa|ausente",
-    "morfologia": "descrição dos filamentos se presentes",
-    "genero_provavel": "Microthrix parvicella (se identificável)"
-  },
-  "alertas_cruzados": [
-    "Correlação 1 entre biota e parâmetros operacionais informados",
-    "Correlação 2 — tendência esperada se parâmetro não for ajustado"
-  ],
   "qualidade_imagem": "boa|regular|ruim",
   "nitidez_score": 0.75,
-  "observacoes_gerais": "síntese técnica do que foi observado no conjunto das imagens"
+  "observacoes_gerais": "observacoes sobre as imagens"
 }"""
 
 
@@ -1421,23 +1382,17 @@ Exemplos: "OD baixo (X mg/L) favorece filamentos e flagelados — consistente co
 # 1. EXTRAÇÃO DE FRAMES COM FILTRO DE QUALIDADE (Variância do Laplaciano)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _score_frame_microscopia(frame_bytes: bytes) -> float:
+def _calcular_nitidez_laplaciano(frame_bytes: bytes) -> float:
     """
-    Score de qualidade específico para microscópio de lodo ativado.
-    Combina três métricas:
-      1. Variância do Laplaciano (nitidez de bordas)
-      2. Penalidade por frames muito brancos (fundo sem organismos) ou muito escuros
-      3. Desvio padrão dos pixels (contraste — frames com organismos têm distribuição ampla)
-
-    Retorna 0.0 se PIL não disponível.
+    Calcula a nitidez de um frame usando variância do Laplaciano.
+    Quanto maior o valor, mais nítida a imagem.
+    Retorna 0.0 se não conseguir calcular (ex: PIL não disponível).
     """
     try:
-        from PIL import Image, ImageFilter, ImageStat
+        from PIL import Image, ImageFilter
         import io as _io
-
-        img = Image.open(_io.BytesIO(frame_bytes)).convert("L")
-
-        # 1. Nitidez pelo Laplaciano
+        img = Image.open(_io.BytesIO(frame_bytes)).convert("L")  # escala de cinza
+        # Aplica filtro Laplaciano para detectar bordas
         lap = img.filter(ImageFilter.Kernel(
             size=3,
             kernel=[-1, -1, -1,
@@ -1445,45 +1400,32 @@ def _score_frame_microscopia(frame_bytes: bytes) -> float:
                     -1, -1, -1],
             scale=1, offset=0
         ))
-        arr_lap = np.array(lap, dtype=np.float32)
-        nitidez = float(np.var(arr_lap))
-
-        # 2. Brilho médio — penalidade para frames brancos (fundo limpo) ou pretos
-        stat = ImageStat.Stat(img)
-        brilho = stat.mean[0]   # 0=preto … 255=branco
-        if brilho > 230 or brilho < 30:
-            fator_brilho = 0.05   # quase descartado — frame inútil
-        elif brilho > 210 or brilho < 60:
-            fator_brilho = 0.40
-        else:
-            fator_brilho = 1.0    # faixa ideal para campo claro: 60-210
-
-        # 3. Contraste (desvio padrão) — frames com organismos têm alto desvio
-        std_px = stat.stddev[0]
-        contraste = min(std_px / 80.0, 1.0)
-
-        # Score composto (nitidez 60% + contraste 40%) × penalidade de brilho
-        return (nitidez * 0.6 + contraste * 100.0 * 0.4) * fator_brilho
-
+        arr = np.array(lap, dtype=np.float32)
+        return float(np.var(arr))  # variância = medida de nitidez
     except Exception:
         return 0.0
 
 
-def _extrair_frames_video(video_bytes: bytes, max_frames: int = 6) -> list:
+def _extrair_frames_video(video_bytes: bytes, max_frames: int = 8) -> list:
     """
-    Extrai até `max_frames` frames do vídeo com ffmpeg.
-    Estratégia dupla: amostragem densa + filtro de score + diversidade temporal.
+    Extrai entre 1 e `max_frames` frames do vídeo usando ffmpeg.
+    Aplica filtro de qualidade (Laplaciano) para selecionar apenas frames nítidos.
+
+    Args:
+        video_bytes: Bytes do arquivo de vídeo
+        max_frames: Número máximo de frames a retornar (padrão: 2)
 
     Returns:
-        Lista de strings base64 dos melhores frames ordenados por timestamp.
+        Lista de strings base64 dos melhores frames
     """
-    frames_candidatos = []  # (score, timestamp, b64)
+    frames_candidatos = []  # lista de (nitidez, b64)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         video_path = os.path.join(tmpdir, "video.mp4")
         with open(video_path, "wb") as f:
             f.write(video_bytes)
 
+        # Obtém duração do vídeo
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", video_path],
@@ -1494,74 +1436,71 @@ def _extrair_frames_video(video_bytes: bytes, max_frames: int = 6) -> list:
         except Exception:
             duration = 10.0
 
-        # Amostra densa: 4× mais candidatos que o necessário, evitando primeiros/últimos 5%
-        n_candidatos = max(max_frames * 4, 24)
-        t_start = duration * 0.05
-        t_end   = duration * 0.95
-        passo   = (t_end - t_start) / max(n_candidatos - 1, 1)
+        # Extrai mais candidatos do que o necessário para poder filtrar
+        n_candidatos = max(max_frames * 3, 6)  # extrai 3x mais para selecionar os melhores
 
         for i in range(n_candidatos):
-            t = t_start + passo * i
-            frame_path = os.path.join(tmpdir, f"frame_{i:03d}.jpg")
+            # Distribui timestamps ao longo do vídeo, evitando início e fim (mais borrados)
+            t = duration * 0.1 + (duration * 0.8) / (n_candidatos + 1) * (i + 1)
+            frame_path = os.path.join(tmpdir, f"frame_{i:02d}.jpg")
+
             subprocess.run(
                 ["ffmpeg", "-ss", str(t), "-i", video_path,
-                 "-vframes", "1",
-                 "-vf", "scale='min(640,iw)':-1",  # máx 640px, preserva proporção
-                 "-q:v", "2",                        # JPEG alta qualidade
+                 "-vframes", "1", "-vf", "scale=512:-1", "-q:v", "3",
                  frame_path, "-y"],
                 capture_output=True
             )
+
             if os.path.exists(frame_path):
                 with open(frame_path, "rb") as fimg:
-                    fb = fimg.read()
-                score = _score_frame_microscopia(fb)
-                frames_candidatos.append((score, t, base64.b64encode(fb).decode()))
+                    frame_bytes_local = fimg.read()
+                nitidez = _calcular_nitidez_laplaciano(frame_bytes_local)
+                b64 = base64.b64encode(frame_bytes_local).decode()
+                frames_candidatos.append((nitidez, b64))
 
     if not frames_candidatos:
         return []
 
+    # Ordena por nitidez (maior = mais nítido) e seleciona os melhores
     frames_candidatos.sort(key=lambda x: x[0], reverse=True)
+    melhores = frames_candidatos[:max_frames]
 
-    # Seleciona os melhores com diversidade temporal mínima (≥5% da duração entre frames)
-    dist_min = duration * 0.05
-    selecionados = []
-    for score, t, b64 in frames_candidatos:
-        if not any(abs(t - ts) < dist_min for _, ts, _ in selecionados):
-            selecionados.append((score, t, b64))
-        if len(selecionados) >= max_frames:
-            break
+    # Log de nitidez para debug
+    nitidez_scores = [round(n, 1) for n, _ in frames_candidatos]
+    print(f"[Microbiologia] Nitidez dos candidatos: {nitidez_scores}")
+    print(f"[Microbiologia] Selecionados: {[round(n, 1) for n, _ in melhores]}")
 
-    # Completa se diversidade eliminou candidatos demais
-    if len(selecionados) < max_frames:
-        usados = {b for _, _, b in selecionados}
-        for score, t, b64 in frames_candidatos:
-            if b64 not in usados:
-                selecionados.append((score, t, b64))
-            if len(selecionados) >= max_frames:
-                break
-
-    print(f"[Frames] {len(frames_candidatos)} candidatos → {len(selecionados)} selecionados")
-    print(f"[Frames] Scores: {[round(s,1) for s,_,_ in selecionados]}")
-    print(f"[Frames] Timestamps: {[round(t,2) for _,t,_ in selecionados]}")
-
-    # Retorna ordenado por timestamp (ordem cronológica para a IA)
-    selecionados.sort(key=lambda x: x[1])
-    return [b64 for _, _, b64 in selecionados]
+    return [b64 for _, b64 in melhores]
 
 
-def _selecionar_melhores_imagens(imagens_bytes: list, max_frames: int = 6) -> list:
+def _selecionar_melhores_imagens(imagens_bytes: list, max_frames: int = 8) -> list:
     """
-    Para imagens estáticas: aplica _score_frame_microscopia e retorna as melhores.
+    Para imagens estáticas (JPG/PNG), aplica filtro de nitidez e retorna as melhores.
+
+    Args:
+        imagens_bytes: Lista de bytes das imagens
+        max_frames: Número máximo de imagens a retornar
+
+    Returns:
+        Lista de strings base64 das imagens mais nítidas
     """
     if not imagens_bytes:
         return []
+
+    # Se há poucas imagens, usa todas
     if len(imagens_bytes) <= max_frames:
         return [base64.b64encode(b).decode() for b in imagens_bytes]
 
-    scored = [(_score_frame_microscopia(b), b) for b in imagens_bytes]
+    # Calcula nitidez de cada imagem
+    scored = []
+    for img_bytes in imagens_bytes:
+        nitidez = _calcular_nitidez_laplaciano(img_bytes)
+        scored.append((nitidez, img_bytes))
+
+    # Seleciona as mais nítidas
     scored.sort(key=lambda x: x[0], reverse=True)
-    print(f"[Imagens] {len(scored)} candidatas → top {max_frames}, scores: {[round(s,1) for s,_ in scored[:max_frames]]}")
-    return [base64.b64encode(b).decode() for _, b in scored[:max_frames]]
+    melhores = scored[:max_frames]
+    return [base64.b64encode(b).decode() for _, b in melhores]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1614,17 +1553,11 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
     if not GOOGLE_API_KEYS:
         raise ValueError("Nenhuma chave GOOGLE_API_KEY configurada nos Secrets.")
 
-    n_chaves = len(GOOGLE_API_KEYS)
-    # Backoff: 2s, 4s, 8s, 16s, 32s — cresce com o número de tentativas, não com o índice de chave
-    BACKOFF_BASE = 2
-    MAX_TENTATIVAS = max(n_chaves * 3, 6)
-    ultimo_status = None
-    ultimo_erro = None
-
+    MAX_TENTATIVAS = max(len(GOOGLE_API_KEYS) * 2, 4)
+    resp = None
     for tentativa in range(MAX_TENTATIVAS):
         chave_atual = next(_api_key_cycle)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={chave_atual}"
-
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={chave_atual}"
         try:
             resp = requests.post(
                 url,
@@ -1633,60 +1566,21 @@ def _chamar_gemini_micro(frames_b64: list, params_operacionais: dict, api_key: s
                 timeout=90
             )
         except requests.exceptions.Timeout:
-            espera = BACKOFF_BASE ** min(tentativa, 4)
-            st.warning(f"⏳ Timeout (tentativa {tentativa+1}/{MAX_TENTATIVAS}). Nova chave em {espera}s...")
-            time.sleep(espera)
-            ultimo_erro = "Timeout"
-            continue
-        except requests.exceptions.RequestException as e:
-            espera = BACKOFF_BASE ** min(tentativa, 4)
-            st.warning(f"⏳ Erro de rede: {e} — tentativa {tentativa+1}/{MAX_TENTATIVAS}. Aguardando {espera}s...")
-            time.sleep(espera)
-            ultimo_erro = str(e)
-            continue
-
-        ultimo_status = resp.status_code
-
-        if resp.status_code == 200:
-            break  # sucesso — sai do loop
-
-        if resp.status_code in (429, 503, 529):
-            motivo = {429: "rate limit (429)", 503: "sobrecarga (503)", 529: "overloaded (529)"}.get(resp.status_code, str(resp.status_code))
-            # Verifica se a API informou um Retry-After
-            retry_after = resp.headers.get("Retry-After")
-            if retry_after:
-                try:
-                    espera = int(retry_after)
-                except ValueError:
-                    espera = BACKOFF_BASE ** min(tentativa, 4)
-            else:
-                espera = BACKOFF_BASE ** min(tentativa, 4)
-            espera = min(espera, 60)  # nunca esperar mais de 60s
-            st.warning(f"⏳ Gemini {motivo} — chave rotacionada. Aguardando {espera}s... (tentativa {tentativa+1}/{MAX_TENTATIVAS})")
+            espera = 2 ** (tentativa // len(GOOGLE_API_KEYS))
+            st.warning(f"⏳ Timeout na tentativa {tentativa+1}/{MAX_TENTATIVAS}. Aguardando {espera}s antes de tentar nova chave...")
             time.sleep(espera)
             continue
 
-        if resp.status_code in (400, 401, 403, 404):
-            # Erros permanentes — não faz sentido retrying com mesma chave
-            st.error(f"❌ Erro permanente da API Gemini: {resp.status_code} — {resp.text[:300]}")
-            raise requests.exceptions.HTTPError(response=resp)
+        if resp.status_code in (503, 429):
+            espera = 2 ** (tentativa // len(GOOGLE_API_KEYS))  # 1s, 2s, 4s, 8s
+            motivo = "sobrecarga (503)" if resp.status_code == 503 else "rate limit (429)"
+            st.warning(f"⏳ Gemini com {motivo} — tentativa {tentativa+1}/{MAX_TENTATIVAS}. Trocando chave e aguardando {espera}s...")
+            time.sleep(espera)
+            continue
 
-        # Outros erros 5xx — tenta novamente
-        espera = BACKOFF_BASE ** min(tentativa, 4)
-        st.warning(f"⏳ Erro {resp.status_code} da API — tentativa {tentativa+1}/{MAX_TENTATIVAS}. Aguardando {espera}s...")
-        time.sleep(espera)
-
+        resp.raise_for_status()
+        break
     else:
-        # Todas as tentativas falharam
-        msg = f"Todas as {MAX_TENTATIVAS} tentativas falharam."
-        if ultimo_status:
-            msg += f" Último status HTTP: {ultimo_status}."
-        if ultimo_erro:
-            msg += f" Último erro: {ultimo_erro}."
-        raise RuntimeError(msg)
-
-    # Se chegou aqui sem 200, ultima tentativa também falhou
-    if ultimo_status and ultimo_status != 200:
         resp.raise_for_status()
 
     data = resp.json()
@@ -1968,24 +1862,25 @@ def render_microbiologia():
             "Selecione uma ou mais fotos do microscópio",
             type=["jpg", "jpeg", "png", "bmp", "tiff"],
             accept_multiple_files=True,
-            help="Envie fotos tiradas pelo microscópio. O sistema seleciona automaticamente as mais nítidas (até 6)."
+            help="Envie fotos tiradas pelo microscópio. O sistema seleciona automaticamente as mais nítidas (até 2)."
         )
         if imagens:
             todas_bytes = [img.read() for img in imagens]
 
-            with st.spinner("🔍 Avaliando nitidez e selecionando os melhores frames..."):
+            # Aplica filtro de qualidade — seleciona até 8 melhores
+            with st.spinner("🔍 Selecionando frames mais nítidos..."):
                 frames_b64 = _selecionar_melhores_imagens(todas_bytes, max_frames=2)
 
-            st.caption(f"✅ {len(imagens)} imagem(ns) enviada(s) → {len(frames_b64)} selecionada(s) pelo score de qualidade:")
-            cols_prev = st.columns(min(len(frames_b64), 3))
+            st.caption(f"✅ {len(imagens)} imagem(ns) enviada(s) → {len(frames_b64)} selecionada(s) pela nitidez:")
+            cols_prev = st.columns(min(len(frames_b64), 2))
             for i, b64 in enumerate(frames_b64):
-                cols_prev[i % 3].image(base64.b64decode(b64), caption=f"Frame {i+1}", use_container_width=True)
+                cols_prev[i % 2].image(base64.b64decode(b64), caption=f"Frame selecionado {i+1}", use_container_width=True)
 
     else:
         video_file = st.file_uploader(
             "Selecione o vídeo (.mp4, .mov, .avi, .webm)",
             type=["mp4", "mov", "avi", "webm", "mkv"],
-            help="O sistema extrai automaticamente os 2 frames mais nítidos e diversificados temporalmente."
+            help="O sistema extrai automaticamente os frames mais nítidos (até 2)."
         )
         if video_file is not None:
             st.video(video_file)
@@ -1993,14 +1888,14 @@ def render_microbiologia():
             video_bytes = video_file.read()
             st.caption(f"Tamanho: {len(video_bytes) / (1024*1024):.1f} MB")
 
-            with st.spinner("🎞️ Extraindo e selecionando melhores frames (score de qualidade + diversidade temporal)..."):
+            with st.spinner("🎞️ Extraindo e filtrando frames por nitidez (Laplaciano)..."):
                 try:
                     frames_b64 = _extrair_frames_video(video_bytes, max_frames=2)
                     if frames_b64:
-                        st.success(f"✅ {len(frames_b64)} frame(s) selecionado(s).")
-                        cols_prev = st.columns(min(len(frames_b64), 3))
+                        st.success(f"✅ {len(frames_b64)} frame(s) nítido(s) selecionado(s).")
+                        cols_prev = st.columns(min(len(frames_b64), 2))
                         for i, b64 in enumerate(frames_b64):
-                            cols_prev[i % 3].image(base64.b64decode(b64), caption=f"Frame {i+1}", use_container_width=True)
+                            cols_prev[i % 2].image(base64.b64decode(b64), caption=f"Frame nítido {i+1}", use_container_width=True)
                     else:
                         st.error("❌ Não foi possível extrair frames. Use o modo Fotos acima.")
                 except Exception as e:
@@ -2015,64 +1910,28 @@ def render_microbiologia():
                 st.error("❌ Nenhuma chave API Google configurada. Adicione GOOGLE_API_KEY (ou GOOGLE_API_KEY_1/2/3) nos Secrets do Streamlit.")
                 st.stop()
 
-            n_chaves = len(GOOGLE_API_KEYS)
-            n_frames = len(frames_b64)
-
-            with st.status(f"Analisando {n_frames} frame(s) — 1 por requisição para respeitar cota gratuita...", expanded=True) as status_micro:
+            with st.status("Analisando frames selecionados...", expanded=True) as status_micro:
                 try:
-                    resultados_por_frame = []
-                    progress = st.progress(0, text="Iniciando análise...")
+                    n_chaves = len(GOOGLE_API_KEYS)
+                    st.write(f"🤖 Enviando {len(frames_b64)} frame(s) numa única requisição (economiza cota) — {n_chaves} chave(s) disponível(is)...")
 
-                    for idx, b64 in enumerate(frames_b64):
-                        # Pausa entre requisições para respeitar RPM do plano gratuito
-                        # gemini-1.5-flash gratuito: 15 RPM → mínimo 4s entre chamadas
-                        # Com múltiplas chaves, o ciclo distribui automaticamente
-                        if idx > 0:
-                            pausa = 5  # 5s entre frames — seguro para plano gratuito (30 RPM)
-                            time.sleep(pausa)
-
-                        pct = int((idx / n_frames) * 100)
-                        progress.progress(pct, text=f"🔬 Analisando frame {idx+1}/{n_frames}...")
-                        st.write(f"• Frame {idx+1}/{n_frames} — enviando para Gemini ({n_chaves} chave(s))...")
-
-                        resultado_frame = _chamar_gemini_micro([b64], params_filtrados)
-                        if not resultado_frame.get("_erro_parse"):
-                            resultados_por_frame.append(resultado_frame)
-                            n_org = len(resultado_frame.get("organismos", []))
-                            st.write(f"  ✅ Frame {idx+1}: {n_org} organismo(s) identificado(s)")
-                        else:
-                            st.write(f"  ⚠️ Frame {idx+1}: erro de parse — descartado da agregação")
-
-                    progress.progress(100, text="Agregando resultados...")
-
-                    if not resultados_por_frame:
-                        st.error("❌ Nenhum frame foi analisado com sucesso.")
-                        st.stop()
-
-                    # Agrega resultados de todos os frames por voto majoritário
-                    st.write(f"📊 Agregando {len(resultados_por_frame)} resultado(s) por voto majoritário...")
+                    # Envia TODOS os frames juntos numa única chamada à API
+                    # Evita múltiplas requisições — importante com limite de 5 RPM
+                    resultado_unico = _chamar_gemini_micro(
+                        frames_b64, params_filtrados
+                    )
+                    resultados_por_frame = [resultado_unico] if not resultado_unico.get("_erro_parse") else []
                     resultado_consolidado = _agregar_resultados(resultados_por_frame)
-
-                    # Propaga analise_floco e filamentos do frame com melhor qualidade_imagem
-                    for r in sorted(resultados_por_frame,
-                                    key=lambda x: {"boa": 2, "regular": 1, "ruim": 0}.get(x.get("qualidade_imagem",""), 1),
-                                    reverse=True):
-                        if r.get("analise_floco"):
-                            resultado_consolidado.setdefault("analise_floco", r["analise_floco"])
-                        if r.get("filamentos"):
-                            resultado_consolidado.setdefault("filamentos", r["filamentos"])
-                        if r.get("alertas_cruzados"):
-                            resultado_consolidado.setdefault("alertas_cruzados", r["alertas_cruzados"])
-                        if resultado_consolidado.get("analise_floco") and resultado_consolidado.get("alertas_cruzados"):
-                            break
 
                     # Aplica regras CETESB
                     st.write("📋 Aplicando regras CETESB L1.025...")
                     diagnostico_cetesb = aplicar_regras_cetesb(resultado_consolidado.get("organismos", []))
+
+                    # Armazena resultado completo
                     resultado_consolidado["diagnostico_cetesb"] = diagnostico_cetesb
                     st.session_state["micro_resultado"] = resultado_consolidado
 
-                    status_micro.update(label=f"✅ Análise concluída! {len(resultados_por_frame)}/{n_frames} frame(s) processado(s).", state="complete")
+                    status_micro.update(label="✅ Análise concluída!", state="complete")
 
                 except requests.exceptions.HTTPError as e:
                     st.error(f"❌ Erro na API: {e.response.status_code} — {e.response.text[:300]}")
@@ -2097,9 +1956,6 @@ def render_microbiologia():
     confianca_med  = resultado.get("confianca_media", 0.0)
     n_analises     = resultado.get("n_analises", 1)
     diag_cetesb    = resultado.get("diagnostico_cetesb", {})
-    analise_floco  = resultado.get("analise_floco", {})
-    filamentos_info = resultado.get("filamentos", {})
-    alertas_cruzados = resultado.get("alertas_cruzados", [])
 
     # Avisos de qualidade de imagem
     if qualidade == "ruim":
@@ -2116,47 +1972,6 @@ def render_microbiologia():
             del st.session_state["micro_resultado"]
             st.rerun()
         return
-
-    # ── Análise do floco ──
-    analise_floco = resultado.get("analise_floco", {})
-    filamentos_info = resultado.get("filamentos", {})
-    alertas_cruzados = resultado.get("alertas_cruzados", [])
-
-    if analise_floco or filamentos_info:
-        st.subheader("🧫 Análise Morfológica do Lodo")
-        cols_morfo = st.columns(2)
-        with cols_morfo[0]:
-            estrutura = analise_floco.get("estrutura", "—")
-            tam = analise_floco.get("tamanho_estimado_um", "—")
-            obs_floco = analise_floco.get("observacoes", "")
-            cor_floco = {"compacto": "#43A047", "disperso": "#E53935", "irregular": "#FB8C00", "filamentoso": "#E53935"}.get(estrutura, "#546E7A")
-            st.markdown(
-                f"""<div style="background:{cor_floco};border-radius:8px;padding:12px 14px;color:white;margin-bottom:8px;">
-                    <div style="font-size:14px;font-weight:600">🔬 Floco: {estrutura.upper()}</div>
-                    <div style="font-size:12px;margin-top:4px;">Tamanho estimado: ~{tam} µm</div>
-                    <div style="font-size:12px;margin-top:4px;opacity:0.9">{obs_floco}</div>
-                </div>""",
-                unsafe_allow_html=True
-            )
-        with cols_morfo[1]:
-            fil_presente = filamentos_info.get("presentes", False)
-            fil_intens = filamentos_info.get("intensidade", "ausente")
-            fil_morfo = filamentos_info.get("morfologia", "")
-            fil_genero = filamentos_info.get("genero_provavel", "")
-            cor_fil = {"ausente": "#43A047", "leve": "#FB8C00", "moderada": "#E53935", "severa": "#B71C1C"}.get(fil_intens, "#546E7A")
-            st.markdown(
-                f"""<div style="background:{cor_fil};border-radius:8px;padding:12px 14px;color:white;margin-bottom:8px;">
-                    <div style="font-size:14px;font-weight:600">🧵 Filamentos: {fil_intens.upper()}</div>
-                    {f'<div style="font-size:12px;margin-top:4px;">{fil_morfo}</div>' if fil_morfo else ''}
-                    {f'<div style="font-size:12px;margin-top:4px;opacity:0.9">Gênero provável: {fil_genero}</div>' if fil_genero else ''}
-                </div>""",
-                unsafe_allow_html=True
-            )
-
-    if alertas_cruzados:
-        st.subheader("⚡ Alertas Cruzados — Biota × Parâmetros Operacionais")
-        for alerta in alertas_cruzados:
-            st.warning(alerta)
 
     # ── Métricas de confiança e qualidade ──
     st.subheader("📊 Resumo da Análise")
@@ -2201,17 +2016,13 @@ def render_microbiologia():
             cor     = COR_SEMAFORO.get(meta["semaforo"], COR_SEMAFORO["cinza"])
             conf    = org.get("confianca", 0.0)
             votos   = org.get("votos", 1)
-            abund   = org.get("abundancia", "")
-            sig_op  = org.get("significado_operacional", "")
             barra   = "█" * int(conf * 10) + "░" * (10 - int(conf * 10))
-            abund_badge = {"raro": "⚪ Raro", "ocasional": "🟡 Ocasional", "frequente": "🔴 Frequente"}.get(abund, "")
 
             st.markdown(
                 f"""<div style="background:{cor};border-radius:8px;padding:12px 14px;margin-bottom:8px;color:white;">
                     <div style="font-size:15px;font-weight:500">{meta['icon']} {org.get('nome','—')}</div>
-                    <div style="font-size:12px;opacity:0.9;margin-top:2px">{org.get('grupo','')}{f' &nbsp;|&nbsp; {abund_badge}' if abund_badge else ''}</div>
+                    <div style="font-size:12px;opacity:0.9;margin-top:2px">{org.get('grupo','')}</div>
                     <div style="font-size:12px;margin-top:6px">{org.get('descricao','')}</div>
-                    {f'<div style="font-size:12px;margin-top:5px;border-top:1px solid rgba(255,255,255,0.3);padding-top:5px;font-style:italic">💡 {sig_op}</div>' if sig_op else ''}
                     {f'<div style="font-size:11px;margin-top:4px;opacity:0.85">📋 {meta["condicao"]}</div>' if meta.get('condicao') else ''}
                     <div style="font-size:11px;margin-top:6px;opacity:0.8">
                         🎯 Confiança: {barra} {conf*100:.0f}%
@@ -2241,39 +2052,11 @@ def render_microbiologia():
     linhas.append(f"Qualidade do processo: {nivel_icon} {nivel_qual}")
     linhas.append(f"Confiança da análise: {confianca_med*100:.0f}%" if confianca_med else "")
     linhas.append("")
-
-    # Floco
-    if analise_floco:
-        linhas.append(f"🧫 Floco: {analise_floco.get('estrutura','—').upper()} (~{analise_floco.get('tamanho_estimado_um','?')} µm)")
-        if analise_floco.get("observacoes"):
-            linhas.append(f"   {analise_floco['observacoes']}")
-        linhas.append("")
-
-    # Filamentos
-    if filamentos_info and filamentos_info.get("intensidade", "ausente") != "ausente":
-        linhas.append(f"🧵 Filamentos: {filamentos_info.get('intensidade','').upper()}")
-        if filamentos_info.get("genero_provavel"):
-            linhas.append(f"   Gênero provável: {filamentos_info['genero_provavel']}")
-        linhas.append("")
-
     linhas.append("Microrganismos identificados:")
     for org in organismos:
-        abund = org.get('abundancia','')
-        abund_str = f" [{abund}]" if abund else ""
         conf_txt = f" (confiança: {org.get('confianca',0)*100:.0f}%)"
-        sig = org.get('significado_operacional','')
-        linhas.append(f"• {org.get('nome','?')} ({org.get('grupo','')}){abund_str}{conf_txt}")
-        linhas.append(f"  {org.get('descricao','')}")
-        if sig:
-            linhas.append(f"  → {sig}")
+        linhas.append(f"• {org.get('nome','?')} ({org.get('grupo','')}){conf_txt}: {org.get('descricao','')}")
     linhas.append("")
-
-    if alertas_cruzados:
-        linhas.append("⚡ Alertas cruzados (biota × operação):")
-        for alerta in alertas_cruzados:
-            linhas.append(f"• {alerta}")
-        linhas.append("")
-
     linhas.append("Diagnóstico:")
     for d in diag_vermelho + diag_laranja + diag_verde:
         linhas.append(f"{d['icon']} {d['condicao']}")
